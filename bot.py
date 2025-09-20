@@ -17,7 +17,7 @@ ADMIN_IDS = [7723510436]  # ضع هنا ID حسابك على تلغرام
 
 # الحصول على متغيرات البيئة
 DATABASE_URL = os.environ.get('DATABASE_URL')
-BOT_TOKEN = os.environ.get('7660785868:AAE2PGkR65ELV9DO3Sj9MTYHkVwfCBDhdLg')
+BOT_TOKEN = os.environ.get('BOT_TOKEN')
 
 # تهيئة قاعدة البيانات
 def init_db():
@@ -328,12 +328,13 @@ def main():
     application = Application.builder().token(BOT_TOKEN).build()
     
     # إضافة handlers
-    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("start", start))    
+    application.add_handler(CallbackQueryHandler(handle_admin_commands, pattern="^(add_button|upload_to_button|list_buttons)$"))
     application.add_handler(CallbackQueryHandler(handle_button, pattern="^(?!admin_).*"))
-    application.add_handler(CallbackQueryHandler(handle_admin_commands, pattern="^admin_.*"))
     application.add_handler(CallbackQueryHandler(back_to_main, pattern="^back_to_main$"))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_admin_messages))
-    application.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_admin_files))
+    application.add_handler(MessageHandler((filters.Document | filters.Photo | filters.Video) & ~filters.COMMAND, handle_admin_files))
+
     
     # بدء البوت
     application.run_polling()

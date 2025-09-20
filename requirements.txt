@@ -1,4 +1,4 @@
-fastapi==0.115.0
-uvicorn==0.30.6
-python-telegram-bot==20.7
-psycopg2-binary==2.9.7
+fastapi==0.116.2
+uvicorn==0.36.0
+python-telegram-bot==22.4
+psycopg2-binary==2.9.10
