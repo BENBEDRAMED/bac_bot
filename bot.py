@@ -40,7 +40,7 @@ def init_db():
     # جدول المستخدمين
     cursor.execute('''
     CREATE TABLE IF NOT EXISTS users (
-        user_id INTEGER PRIMARY KEY,
+        user_id BIGINT PRIMARY KEY,
         first_name TEXT,
         last_name TEXT,
         class_type TEXT,
