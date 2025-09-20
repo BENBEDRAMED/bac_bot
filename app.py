@@ -13,11 +13,11 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # بيانات المشرف (يمكنك تغييرها)
-ADMIN_IDS = [7427206899]  # ضع هنا ID حسابك على تلغرام
+ADMIN_IDS = [7723510436]  # ضع هنا ID حسابك على تلغرام
 
 # الحصول على متغيرات البيئة
 DATABASE_URL = os.environ.get('DATABASE_URL')
-BOT_TOKEN = os.environ.get('8481478915:AAEI0vcsF_6L7_5kg7_W2A2cFYYaEtgadQM')
+BOT_TOKEN = os.environ.get('7660785868:AAE2PGkR65ELV9DO3Sj9MTYHkVwfCBDhdLg')
 
 # تهيئة قاعدة البيانات
 def init_db():
