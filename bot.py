@@ -333,7 +333,7 @@ def main():
     application.add_handler(CallbackQueryHandler(handle_button, pattern="^(?!admin_).*"))
     application.add_handler(CallbackQueryHandler(back_to_main, pattern="^back_to_main$"))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_admin_messages))
-    application.add_handler(MessageHandler((filters.Document | filters.Photo | filters.Video) & ~filters.COMMAND, handle_admin_files))
+    application.add_handler(MessageHandler((filters.Document | filters.PHOTO | filters.VIDEO) & ~filters.COMMAND, handle_admin_files))
 
     
     # بدء البوت
