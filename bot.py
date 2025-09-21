@@ -7,8 +7,6 @@ from urllib.parse import urlparse
 from flask import Flask, request
 import json
 import time
-import asyncio
-from threading import Thread
 
 # Configure logging
 logging.basicConfig(
@@ -27,48 +25,8 @@ except ValueError as e:
     logger.error(f"Error parsing ADMIN_IDS: {e}")
     ADMIN_IDS = []
 
-# Flask app for webhooks
-app = Flask(__name__)
-
 # Global application variable
 telegram_app = None
-update_queue = asyncio.Queue()
-
-# Initialize the Telegram application
-def init_telegram_app():
-    global telegram_app
-    
-    # Check required environment variables
-    if not all([BOT_TOKEN, DATABASE_URL, WEBHOOK_SECRET_TOKEN]):
-        logger.error("Missing required environment variables: BOT_TOKEN, DATABASE_URL, or WEBHOOK_SECRET_TOKEN")
-        return False
-    
-    # Initialize database
-    init_db()
-    
-    # Set up bot
-    telegram_app = Application.builder().token(BOT_TOKEN).build()
-    
-    # Add handlers
-    telegram_app.add_handler(CommandHandler("start", start))
-    telegram_app.add_handler(CallbackQueryHandler(handle_button, pattern="^(?!admin_).*"))
-    telegram_app.add_handler(CallbackQueryHandler(handle_admin_commands, pattern="^admin_.*"))
-    telegram_app.add_handler(CallbackQueryHandler(back_to_main, pattern="^back_to_main$"))
-    telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_admin_messages))
-    telegram_app.add_handler(MessageHandler(filters.Document.ALL | filters.PHOTO | filters.VIDEO | filters.TEXT, handle_admin_files))
-    
-    # Start the application in a separate thread
-    def run_app():
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        loop.run_until_complete(telegram_app.initialize())
-        loop.run_until_complete(telegram_app.start())
-        loop.run_forever()
-    
-    thread = Thread(target=run_app, daemon=True)
-    thread.start()
-    
-    return True
 
 # Database connection with retry
 def get_db_connection(max_retries=3, retry_delay=5):
@@ -416,42 +374,58 @@ async def back_to_main(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     await show_main_menu(update, context)
 
-# Flask routes
-@app.route('/')
-def index():
-    return "البوت يعمل بشكل صحيح!"
-
-@app.route('/webhook', methods=['POST'])
-def webhook():
+# Initialize and run the bot
+async def main():
     global telegram_app
-    if telegram_app is None:
-        logger.error("Telegram application not initialized")
-        return 'Service Unavailable', 503
-        
+    
+    # Check required environment variables
+    if not all([BOT_TOKEN, DATABASE_URL, WEBHOOK_SECRET_TOKEN]):
+        logger.error("Missing required environment variables: BOT_TOKEN, DATABASE_URL, or WEBHOOK_SECRET_TOKEN")
+        return
+    
+    # Initialize database
+    init_db()
+    
+    # Set up bot
+    telegram_app = Application.builder().token(BOT_TOKEN).build()
+    
+    # Add handlers
+    telegram_app.add_handler(CommandHandler("start", start))
+    telegram_app.add_handler(CallbackQueryHandler(handle_button, pattern="^(?!admin_).*"))
+    telegram_app.add_handler(CallbackQueryHandler(handle_admin_commands, pattern="^admin_.*"))
+    telegram_app.add_handler(CallbackQueryHandler(back_to_main, pattern="^back_to_main$"))
+    telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_admin_messages))
+    telegram_app.add_handler(MessageHandler(filters.Document.ALL | filters.PHOTO | filters.VIDEO | filters.TEXT, handle_admin_files))
+    
+    # Set up webhook
+    webhook_url = os.environ.get('WEBHOOK_URL')
+    if not webhook_url:
+        logger.error("WEBHOOK_URL environment variable not set")
+        return
+    
+    port = int(os.environ.get('PORT', 10000))
+    
+    await telegram_app.bot.set_webhook(
+        url=f"{webhook_url}/webhook",
+        secret_token=WEBHOOK_SECRET_TOKEN
+    )
+    
+    logger.info(f"Webhook set to {webhook_url}/webhook")
+    
+    # Start the application
+    await telegram_app.initialize()
+    await telegram_app.start()
+    
     try:
-        # Process the update in the Telegram application's event loop
-        update = Update.de_json(request.get_json(), telegram_app.bot)
-        if update:
-            # Use the application's event loop to process the update
-            loop = telegram_app._event_loop
-            future = asyncio.run_coroutine_threadsafe(
-                telegram_app.process_update(update), 
-                loop
-            )
-            future.result()  # Wait for the result
-            return 'OK'
-        else:
-            logger.error("Invalid update received")
-            return 'Invalid update', 400
-    except Exception as e:
-        logger.error(f"Webhook error: {e}")
-        return 'Error', 500
-
-# Initialize the application when the module is imported
-if not init_telegram_app():
-    logger.error("Failed to initialize Telegram application")
+        # Keep the application running
+        while True:
+            await asyncio.sleep(3600)  # Sleep for 1 hour
+    except KeyboardInterrupt:
+        pass
+    finally:
+        await telegram_app.stop()
+        await telegram_app.shutdown()
 
 if __name__ == "__main__":
-    # This is for development only
-    port = int(os.environ.get('PORT', 10000))
-    app.run(host='0.0.0.0', port=port)
+    import asyncio
+    asyncio.run(main())
