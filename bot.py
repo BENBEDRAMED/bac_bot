@@ -29,7 +29,32 @@ except ValueError as e:
 app = Flask(__name__)
 
 # Global application variable
-application = None
+telegram_app = None
+
+# Initialize the Telegram application
+def init_telegram_app():
+    global telegram_app
+    
+    # Check required environment variables
+    if not all([BOT_TOKEN, DATABASE_URL, WEBHOOK_SECRET_TOKEN]):
+        logger.error("Missing required environment variables: BOT_TOKEN, DATABASE_URL, or WEBHOOK_SECRET_TOKEN")
+        return False
+    
+    # Initialize database
+    init_db()
+    
+    # Set up bot
+    telegram_app = Application.builder().token(BOT_TOKEN).build()
+    
+    # Add handlers
+    telegram_app.add_handler(CommandHandler("start", start))
+    telegram_app.add_handler(CallbackQueryHandler(handle_button, pattern="^(?!admin_).*"))
+    telegram_app.add_handler(CallbackQueryHandler(handle_admin_commands, pattern="^admin_.*"))
+    telegram_app.add_handler(CallbackQueryHandler(back_to_main, pattern="^back_to_main$"))
+    telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_admin_messages))
+    telegram_app.add_handler(MessageHandler(filters.Document.ALL | filters.PHOTO | filters.VIDEO | filters.TEXT, handle_admin_files))
+    
+    return True
 
 # Database connection with retry
 def get_db_connection(max_retries=3, retry_delay=5):
@@ -384,15 +409,15 @@ def index():
 
 @app.route('/webhook', methods=['POST'])
 def webhook():
-    global application
-    if application is None:
-        logger.error("Application not initialized")
+    global telegram_app
+    if telegram_app is None:
+        logger.error("Telegram application not initialized")
         return 'Service Unavailable', 503
         
     try:
-        update = Update.de_json(request.get_json(), application.bot)
+        update = Update.de_json(request.get_json(), telegram_app.bot)
         if update:
-            application.process_update(update)
+            telegram_app.process_update(update)
             return 'OK'
         else:
             logger.error("Invalid update received")
@@ -401,46 +426,11 @@ def webhook():
         logger.error(f"Webhook error: {e}")
         return 'Error', 500
 
-def main():
-    global application
-    
-    # Check required environment variables
-    if not all([BOT_TOKEN, DATABASE_URL, WEBHOOK_SECRET_TOKEN]):
-        logger.error("Missing required environment variables: BOT_TOKEN, DATABASE_URL, or WEBHOOK_SECRET_TOKEN")
-        return
-    
-    # Initialize database
-    init_db()
-    
-    # Set up bot
-    application = Application.builder().token(BOT_TOKEN).build()
-    
-    # Add handlers
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CallbackQueryHandler(handle_button, pattern="^(?!admin_).*"))
-    application.add_handler(CallbackQueryHandler(handle_admin_commands, pattern="^admin_.*"))
-    application.add_handler(CallbackQueryHandler(back_to_main, pattern="^back_to_main$"))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_admin_messages))
-    application.add_handler(MessageHandler(filters.Document.ALL | filters.PHOTO | filters.VIDEO | filters.TEXT, handle_admin_files))
-    
-    # Start webhook
-    port = int(os.environ.get('PORT', 10000))
-    webhook_url = os.environ.get('WEBHOOK_URL')
-    
-    if not webhook_url:
-        logger.error("WEBHOOK_URL environment variable not set")
-        return
-    
-    try:
-        application.run_webhook(
-            listen="0.0.0.0",
-            port=port,
-            webhook_url=webhook_url,
-            secret_token=WEBHOOK_SECRET_TOKEN
-        )
-        logger.info(f"Webhook started at {webhook_url}")
-    except Exception as e:
-        logger.error(f"Failed to start webhook: {e}")
+# Initialize the application when the module is imported
+if not init_telegram_app():
+    logger.error("Failed to initialize Telegram application")
 
 if __name__ == "__main__":
-    main()
+    # This is for development only
+    port = int(os.environ.get('PORT', 10000))
+    app.run(host='0.0.0.0', port=port)
