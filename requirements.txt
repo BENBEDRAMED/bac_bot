@@ -1,10 +1,12 @@
 
+python-telegram-bot==22.4
 psycopg2-binary==2.9.10
 flask==3.0.3
+gunicorn==23.0.0
+gevent==24.10.2
 httpx==0.28.1
 anyio==4.10.0
 httpcore==1.0.9
 certifi==2025.8.3
 python-dotenv==1.0.1
 typing-extensions==4.12.0
-python-telegram-bot==22.4
