@@ -7,6 +7,8 @@ from urllib.parse import urlparse
 from flask import Flask, request
 import json
 import time
+import asyncio
+from threading import Thread
 
 # Configure logging
 logging.basicConfig(
@@ -30,6 +32,7 @@ app = Flask(__name__)
 
 # Global application variable
 telegram_app = None
+update_queue = asyncio.Queue()
 
 # Initialize the Telegram application
 def init_telegram_app():
@@ -53,6 +56,17 @@ def init_telegram_app():
     telegram_app.add_handler(CallbackQueryHandler(back_to_main, pattern="^back_to_main$"))
     telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_admin_messages))
     telegram_app.add_handler(MessageHandler(filters.Document.ALL | filters.PHOTO | filters.VIDEO | filters.TEXT, handle_admin_files))
+    
+    # Start the application in a separate thread
+    def run_app():
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(telegram_app.initialize())
+        loop.run_until_complete(telegram_app.start())
+        loop.run_forever()
+    
+    thread = Thread(target=run_app, daemon=True)
+    thread.start()
     
     return True
 
@@ -415,9 +429,16 @@ def webhook():
         return 'Service Unavailable', 503
         
     try:
+        # Process the update in the Telegram application's event loop
         update = Update.de_json(request.get_json(), telegram_app.bot)
         if update:
-            telegram_app.process_update(update)
+            # Use the application's event loop to process the update
+            loop = telegram_app._event_loop
+            future = asyncio.run_coroutine_threadsafe(
+                telegram_app.process_update(update), 
+                loop
+            )
+            future.result()  # Wait for the result
             return 'OK'
         else:
             logger.error("Invalid update received")
