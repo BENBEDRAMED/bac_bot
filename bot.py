@@ -4,9 +4,9 @@ import psycopg2
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, ContextTypes, CallbackQueryHandler, MessageHandler, filters
 from urllib.parse import urlparse
-from flask import Flask, request
 import json
 import time
+import asyncio
 
 # Configure logging
 logging.basicConfig(
@@ -24,9 +24,6 @@ try:
 except ValueError as e:
     logger.error(f"Error parsing ADMIN_IDS: {e}")
     ADMIN_IDS = []
-
-# Global application variable
-telegram_app = None
 
 # Database connection with retry
 def get_db_connection(max_retries=3, retry_delay=5):
@@ -376,8 +373,6 @@ async def back_to_main(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # Initialize and run the bot
 async def main():
-    global telegram_app
-    
     # Check required environment variables
     if not all([BOT_TOKEN, DATABASE_URL, WEBHOOK_SECRET_TOKEN]):
         logger.error("Missing required environment variables: BOT_TOKEN, DATABASE_URL, or WEBHOOK_SECRET_TOKEN")
@@ -387,15 +382,15 @@ async def main():
     init_db()
     
     # Set up bot
-    telegram_app = Application.builder().token(BOT_TOKEN).build()
+    application = Application.builder().token(BOT_TOKEN).build()
     
     # Add handlers
-    telegram_app.add_handler(CommandHandler("start", start))
-    telegram_app.add_handler(CallbackQueryHandler(handle_button, pattern="^(?!admin_).*"))
-    telegram_app.add_handler(CallbackQueryHandler(handle_admin_commands, pattern="^admin_.*"))
-    telegram_app.add_handler(CallbackQueryHandler(back_to_main, pattern="^back_to_main$"))
-    telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_admin_messages))
-    telegram_app.add_handler(MessageHandler(filters.Document.ALL | filters.PHOTO | filters.VIDEO | filters.TEXT, handle_admin_files))
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CallbackQueryHandler(handle_button, pattern="^(?!admin_).*"))
+    application.add_handler(CallbackQueryHandler(handle_admin_commands, pattern="^admin_.*"))
+    application.add_handler(CallbackQueryHandler(back_to_main, pattern="^back_to_main$"))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_admin_messages))
+    application.add_handler(MessageHandler(filters.Document.ALL | filters.PHOTO | filters.VIDEO | filters.TEXT, handle_admin_files))
     
     # Set up webhook
     webhook_url = os.environ.get('WEBHOOK_URL')
@@ -405,27 +400,21 @@ async def main():
     
     port = int(os.environ.get('PORT', 10000))
     
-    await telegram_app.bot.set_webhook(
+    await application.bot.set_webhook(
         url=f"{webhook_url}/webhook",
         secret_token=WEBHOOK_SECRET_TOKEN
     )
     
     logger.info(f"Webhook set to {webhook_url}/webhook")
+    logger.info("Bot is running...")
     
-    # Start the application
-    await telegram_app.initialize()
-    await telegram_app.start()
-    
-    try:
-        # Keep the application running
-        while True:
-            await asyncio.sleep(3600)  # Sleep for 1 hour
-    except KeyboardInterrupt:
-        pass
-    finally:
-        await telegram_app.stop()
-        await telegram_app.shutdown()
+    # Start the application with webhook
+    await application.run_webhook(
+        listen="0.0.0.0",
+        port=port,
+        webhook_url=f"{webhook_url}/webhook",
+        secret_token=WEBHOOK_SECRET_TOKEN
+    )
 
 if __name__ == "__main__":
-    import asyncio
     asyncio.run(main())
