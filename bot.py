@@ -28,6 +28,9 @@ except ValueError as e:
 # Flask app for webhooks
 app = Flask(__name__)
 
+# Global application variable
+application = None
+
 # Database connection with retry
 def get_db_connection(max_retries=3, retry_delay=5):
     for attempt in range(max_retries):
@@ -381,6 +384,11 @@ def index():
 
 @app.route('/webhook', methods=['POST'])
 def webhook():
+    global application
+    if application is None:
+        logger.error("Application not initialized")
+        return 'Service Unavailable', 503
+        
     try:
         update = Update.de_json(request.get_json(), application.bot)
         if update:
@@ -394,6 +402,8 @@ def webhook():
         return 'Error', 500
 
 def main():
+    global application
+    
     # Check required environment variables
     if not all([BOT_TOKEN, DATABASE_URL, WEBHOOK_SECRET_TOKEN]):
         logger.error("Missing required environment variables: BOT_TOKEN, DATABASE_URL, or WEBHOOK_SECRET_TOKEN")
@@ -403,7 +413,6 @@ def main():
     init_db()
     
     # Set up bot
-    global application
     application = Application.builder().token(BOT_TOKEN).build()
     
     # Add handlers
