@@ -143,7 +143,7 @@ async def index():
 async def webhook(request: Request):
     """
     Main Telegram webhook receiver.
-    Validates secret token header if configured and handles /start messages.
+    Validates secret token header if configured and handles /start messages and callback_query.
     """
     # Validate secret token header (if configured)
     if WEBHOOK_SECRET_TOKEN:
@@ -156,40 +156,247 @@ async def webhook(request: Request):
     try:
         data = await request.json()
     except Exception as e:
-        logger.error("Failed to parse JSON from webhook: %s", e)
+        logger.error("Failed to parse JSON from webhook request: %s", e)
         raise HTTPException(status_code=400, detail="Invalid JSON")
 
-    logger.info("Incoming webhook update id=%s type keys=%s", data.get("update_id"), list(data.keys()))
+    logger.info("Incoming webhook update id=%s keys=%s", data.get("update_id"), list(data.keys()))
 
-    # Protect: ignore updates that are from bots (including this bot) to avoid loops
-    # For message updates:
+    # ---------- Protect against bot loops ----------
+    # If message update is from a bot (including our bot), ignore
     if "message" in data and isinstance(data["message"], dict):
-        msg = data["message"]
-        from_user = msg.get("from", {})
-
-        # If there is no from_user information, just acknowledge
-        if not isinstance(from_user, dict):
+        from_user = data["message"].get("from", {})
+        if isinstance(from_user, dict) and from_user.get("is_bot"):
+            logger.debug("Ignoring message from a bot (is_bot=True).")
+            return JSONResponse({"ok": True})
+        if BOT_ID is not None and isinstance(from_user, dict) and from_user.get("id") == BOT_ID:
+            logger.debug("Ignoring message from this bot's own id.")
             return JSONResponse({"ok": True})
 
-        # Ignore messages coming from any bot account
-        if from_user.get("is_bot"):
-            logger.debug("Ignoring update from a bot account (is_bot=True).")
+    # If callback_query and originated from bot, ignore
+    if "callback_query" in data and isinstance(data["callback_query"], dict):
+        cq_from = data["callback_query"].get("from", {})
+        if isinstance(cq_from, dict) and cq_from.get("is_bot"):
+            logger.debug("Ignoring callback_query from a bot (is_bot=True).")
+            return JSONResponse({"ok": True})
+        if BOT_ID is not None and isinstance(cq_from, dict) and cq_from.get("id") == BOT_ID:
+            logger.debug("Ignoring callback_query from this bot's own id.")
             return JSONResponse({"ok": True})
 
-        # Also ignore messages coming from this bot's own user id (double safety)
-        if BOT_ID is not None and from_user.get("id") == BOT_ID:
-            logger.debug("Ignoring update from this bot's own id.")
+    # ---------- Handle callback_query updates ----------
+    if "callback_query" in data and isinstance(data["callback_query"], dict):
+        cq = data["callback_query"]
+        cq_id = cq.get("id")
+        cq_data = cq.get("data")
+        from_user = cq.get("from", {})
+        message = cq.get("message") or {}
+        chat = message.get("chat", {})
+        chat_id = chat.get("id")
+        message_id = message.get("message_id")
+
+        logger.info("Received callback_query id=%s data=%s from=%s", cq_id, cq_data, from_user.get("id"))
+
+        # Defensive checks
+        if not cq_data:
+            if bot and cq_id:
+                try:
+                    await bot.answer_callback_query(callback_query_id=cq_id)
+                except Exception:
+                    pass
             return JSONResponse({"ok": True})
 
-    # Handle /start messages only (from humans)
+        # Handle special callback_data
+        if cq_data == "back_to_main":
+            # show root buttons
+            conn = get_db_connection()
+            if conn:
+                try:
+                    cur = conn.cursor()
+                    cur.execute("SELECT name, callback_data FROM buttons WHERE parent_id = 0")
+                    buttons = cur.fetchall()
+                    cur.close()
+                except Exception as e:
+                    logger.exception("DB error fetching main buttons: %s", e)
+                    buttons = []
+                finally:
+                    conn.close()
+            else:
+                buttons = []
+
+            if buttons:
+                keyboard = [[InlineKeyboardButton(name, callback_data=cb)] for name, cb in buttons]
+                reply_markup = InlineKeyboardMarkup(keyboard)
+                # edit the original message to show main menu
+                try:
+                    if bot and chat_id and message_id:
+                        await bot.edit_message_text(chat_id=chat_id, message_id=message_id, text="اختر القسم المناسب:", reply_markup=reply_markup)
+                        await bot.answer_callback_query(callback_query_id=cq_id)
+                except Exception as e:
+                    logger.exception("Failed to edit message for back_to_main: %s", e)
+                    try:
+                        if bot and cq_id:
+                            await bot.answer_callback_query(callback_query_id=cq_id, text="حدث خطأ. حاول لاحقاً.")
+                    except Exception:
+                        pass
+            else:
+                try:
+                    if bot and cq_id:
+                        await bot.answer_callback_query(callback_query_id=cq_id, text="لا توجد أقسام متاحة حالياً.")
+                except Exception:
+                    pass
+            return JSONResponse({"ok": True})
+
+        # Admin panel shortcut
+        if cq_data == "admin_panel":
+            user_id = from_user.get("id")
+            if is_admin(user_id):
+                keyboard = [
+                    [InlineKeyboardButton("إضافة زر جديد", callback_data="admin_add_button")],
+                    [InlineKeyboardButton("رفع ملف لزر موجود", callback_data="admin_upload_to_button")],
+                    [InlineKeyboardButton("عرض جميع الأزرار", callback_data="admin_list_buttons")],
+                    [InlineKeyboardButton("العودة للقائمة الرئيسية", callback_data="back_to_main")]
+                ]
+                reply_markup = InlineKeyboardMarkup(keyboard)
+                try:
+                    if bot and chat_id and message_id:
+                        await bot.edit_message_text(chat_id=chat_id, message_id=message_id, text="لوحة تحكم المشرف:", reply_markup=reply_markup)
+                        await bot.answer_callback_query(callback_query_id=cq_id)
+                except Exception as e:
+                    logger.exception("Failed to show admin panel: %s", e)
+                    try:
+                        if bot and cq_id:
+                            await bot.answer_callback_query(callback_query_id=cq_id, text="خطأ أثناء عرض لوحة المشرف.")
+                    except Exception:
+                        pass
+            else:
+                try:
+                    if bot and cq_id:
+                        await bot.answer_callback_query(callback_query_id=cq_id, text="ليس لديك صلاحية للوصول إلى هذه الصفحة.")
+                except Exception:
+                    pass
+            return JSONResponse({"ok": True})
+
+        # Otherwise, check if this callback maps to a button with content
+        conn = get_db_connection()
+        if conn is None:
+            logger.error("DB connection failed while handling callback_query")
+            try:
+                if bot and cq_id:
+                    await bot.answer_callback_query(callback_query_id=cq_id, text="خدمة غير متاحة الآن.")
+            except Exception:
+                pass
+            return JSONResponse({"ok": True})
+
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT content_type, file_id, id FROM buttons WHERE callback_data = %s", (cq_data,))
+            row = cur.fetchone()
+        except Exception as e:
+            logger.exception("DB error while fetching button for callback: %s", e)
+            row = None
+        finally:
+            try:
+                cur.close()
+            except Exception:
+                pass
+            conn.close()
+
+        # If button has content -> send it (new message) and answer callback
+        if row and row[0] and row[1]:
+            content_type, file_id, _id = row
+            try:
+                if content_type == "document":
+                    await bot.send_document(chat_id=chat_id, document=file_id)
+                elif content_type == "photo":
+                    await bot.send_photo(chat_id=chat_id, photo=file_id)
+                elif content_type == "video":
+                    await bot.send_video(chat_id=chat_id, video=file_id)
+                else:
+                    # content_type == 'text' or unknown -> send text
+                    await bot.send_message(chat_id=chat_id, text=str(file_id))
+                # acknowledge the callback
+                if cq_id:
+                    await bot.answer_callback_query(callback_query_id=cq_id)
+            except Exception as e:
+                logger.exception("Error sending content for callback: %s", e)
+                try:
+                    if cq_id:
+                        await bot.answer_callback_query(callback_query_id=cq_id, text="خطأ أثناء إرسال المحتوى.")
+                except Exception:
+                    pass
+            return JSONResponse({"ok": True})
+
+        # No direct content -> treat as parent and show submenu (or say empty)
+        # Re-open DB to find by callback_data id (in case row not found earlier)
+        conn = get_db_connection()
+        if conn is None:
+            try:
+                if cq_id:
+                    await bot.answer_callback_query(callback_query_id=cq_id, text="خدمة غير متاحة الآن.")
+            except Exception:
+                pass
+            return JSONResponse({"ok": True})
+
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT id FROM buttons WHERE callback_data = %s", (cq_data,))
+            parent_row = cur.fetchone()
+            if not parent_row:
+                # not found
+                if cq_id:
+                    await bot.answer_callback_query(callback_query_id=cq_id, text="الزر غير موجود.")
+                cur.close()
+                conn.close()
+                return JSONResponse({"ok": True})
+            parent_id = parent_row[0]
+            cur.execute("SELECT name, callback_data FROM buttons WHERE parent_id = %s", (parent_id,))
+            sub_buttons = cur.fetchall()
+            cur.close()
+        except Exception as e:
+            logger.exception("DB error when fetching submenu: %s", e)
+            sub_buttons = []
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+        if sub_buttons:
+            keyboard = [[InlineKeyboardButton(name, callback_data=cb)] for name, cb in sub_buttons]
+            keyboard.append([InlineKeyboardButton("العودة", callback_data="back_to_main")])
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            try:
+                # edit the original message to show submenu
+                if bot and chat_id and message_id:
+                    await bot.edit_message_text(chat_id=chat_id, message_id=message_id, text="اختر من القائمة:", reply_markup=reply_markup)
+                    if cq_id:
+                        await bot.answer_callback_query(callback_query_id=cq_id)
+            except Exception as e:
+                logger.exception("Failed to edit message for submenu: %s", e)
+                try:
+                    if cq_id:
+                        await bot.answer_callback_query(callback_query_id=cq_id, text="حدث خطأ. حاول لاحقاً.")
+                except Exception:
+                    pass
+        else:
+            try:
+                if cq_id:
+                    await bot.answer_callback_query(callback_query_id=cq_id, text="هذه القائمة لا تحتوي على محتوى بعد.")
+            except Exception:
+                pass
+        return JSONResponse({"ok": True})
+
+    # ---------- Handle plain /start messages ----------
     if "message" in data and isinstance(data["message"], dict):
         msg = data["message"]
         text = msg.get("text", "")
         chat = msg.get("chat", {})
         from_user = msg.get("from", {})
 
+        # ensure it's from a human user and not a bot (we already filtered bots above)
+        if not isinstance(from_user, dict) or from_user.get("is_bot"):
+            return JSONResponse({"ok": True})
+
         if isinstance(text, str) and text.strip().lower().startswith("/start"):
-            # Defensive extraction
             chat_id = chat.get("id")
             user_id = from_user.get("id")
             first_name = from_user.get("first_name", "")
@@ -198,11 +405,10 @@ async def webhook(request: Request):
                 logger.warning("Missing chat_id or user_id in /start update; ignoring.")
                 return JSONResponse({"ok": True})
 
-            # Save user to DB
+            # Save user to DB and load root buttons
             conn = get_db_connection()
             if conn is None:
                 logger.error("DB connection failed while handling /start")
-                # Return 200 to acknowledge so Telegram won't retry infinitely
                 return JSONResponse({"ok": False, "error": "db"}, status_code=200)
 
             buttons = []
@@ -227,13 +433,13 @@ async def webhook(request: Request):
                     pass
                 conn.close()
 
-            # Build reply keyboard
+            # Build keyboard
             reply_markup = None
             if buttons:
                 keyboard = [[InlineKeyboardButton(name, callback_data=callback_data)] for name, callback_data in buttons]
                 reply_markup = InlineKeyboardMarkup(keyboard)
 
-            # Send reply message (async)
+            # Send reply message
             try:
                 if not bot:
                     logger.error("Bot not initialized; cannot send message.")
@@ -248,7 +454,7 @@ async def webhook(request: Request):
 
             return JSONResponse({"ok": True})
 
-    # Acknowledge all other update types (no-op)
+    # Acknowledge all other update types
     return JSONResponse({"ok": True})
 
 
@@ -273,7 +479,6 @@ async def on_startup():
     # Initialize Bot instance
     try:
         bot = Bot(token=BOT_TOKEN)
-        # fetch bot info to get BOT_ID (async)
         me = await bot.get_me()
         if isinstance(me, User):
             BOT_ID = me.id
@@ -320,7 +525,6 @@ async def on_shutdown():
 def main():
     port = int(os.environ.get("PORT", 10000))
     logger.info("Starting uvicorn on 0.0.0.0:%s", port)
-    # uvicorn.run is blocking and will serve the FastAPI app
     uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")
 
 
