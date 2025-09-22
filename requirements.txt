@@ -1,5 +1,5 @@
 
-
+fastapi==0.116.2
 psycopg2-binary==2.9.10
 flask==3.0.3
 gunicorn==23.0.0
