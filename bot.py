@@ -1,27 +1,20 @@
 # bot.py
-"""
-FastAPI webhook Telegram bot with detailed diagnostic logging.
-
-Usage:
- - Set your env vars: BOT_TOKEN, DATABASE_URL, WEBHOOK_URL (optional), WEBHOOK_SECRET_TOKEN (optional),
-   ADMIN_IDS (comma-separated), REQUIRED_CHATS (comma-separated @usernames or -100... ids)
- - Deploy and watch logs. This file is the same logic as before but with much more logging.
-"""
-
-import logging
 import os
 import time
+import asyncio
+import logging
 from collections import deque
-from typing import Optional, Dict, Any, List, Tuple
+from typing import Optional, Dict, Any, List, Tuple, Callable
 from urllib.parse import urlparse
 
 import psycopg2
+from psycopg2.pool import ThreadedConnectionPool
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse, PlainTextResponse
 import uvicorn
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Bot
+from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
 
-# -------------------- Logging --------------------
+# -------------------- Config & Logging --------------------
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -29,143 +22,159 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# -------------------- Environment --------------------
 BOT_TOKEN: Optional[str] = os.environ.get("BOT_TOKEN")
 WEBHOOK_URL: Optional[str] = os.environ.get("WEBHOOK_URL")
 WEBHOOK_SECRET_TOKEN: Optional[str] = os.environ.get("WEBHOOK_SECRET_TOKEN")
 DATABASE_URL: Optional[str] = os.environ.get("DATABASE_URL")
+ADMIN_IDS_ENV = os.environ.get("ADMIN_IDS", "")
 try:
-    ADMIN_IDS = [int(x.strip()) for x in os.environ.get("ADMIN_IDS", "").split(",") if x.strip()]
+    ADMIN_IDS: List[int] = [int(x.strip()) for x in ADMIN_IDS_ENV.split(",") if x.strip()]
 except Exception:
     ADMIN_IDS = []
 
 REQUIRED_CHATS_RAW = os.environ.get("REQUIRED_CHATS", "")
 REQUIRED_CHATS: List[str] = [c.strip() for c in REQUIRED_CHATS_RAW.split(",") if c.strip()]
 
-PORT: int = int(os.environ.get("PORT", 10000))
+PORT = int(os.environ.get("PORT", 10000))
+DB_POOL_MIN = int(os.environ.get("DB_POOL_MIN", 1))
+DB_POOL_MAX = int(os.environ.get("DB_POOL_MAX", 10))
 
 # -------------------- Globals --------------------
 app = FastAPI()
 bot: Optional[Bot] = None
 BOT_ID: Optional[int] = None
 
+# DB pool (Threaded) to avoid blocking event loop
+db_pool: Optional[ThreadedConnectionPool] = None
+
+# In-memory small structures
 PROCESSED_UPDATES = deque(maxlen=5000)
-admin_state: Dict[int, Dict[str, Any]] = {}
+admin_state: Dict[int, Dict[str, Any]] = {}  # admin flows in-memory
 
-# -------------------- DB helpers --------------------
-def get_db_connection(max_retries: int = 3, retry_delay: int = 2):
-    if not DATABASE_URL:
-        logger.error("DATABASE_URL not set")
-        return None
-    last_exc = None
-    for attempt in range(1, max_retries + 1):
-        try:
-            logger.debug("Attempting DB connection (attempt %d/%d)", attempt, max_retries)
-            result = urlparse(DATABASE_URL)
-            conn = psycopg2.connect(
-                database=result.path[1:],
-                user=result.username,
-                password=result.password,
-                host=result.hostname,
-                port=result.port,
-                connect_timeout=10,
-            )
-            logger.info("Database connection established")
-            return conn
-        except Exception as e:
-            last_exc = e
-            logger.warning("DB connect attempt %d failed: %s", attempt, e)
-            if attempt < max_retries:
-                time.sleep(retry_delay)
-    logger.error("All DB connection attempts failed: %s", last_exc)
-    return None
-
-def init_db():
-    conn = get_db_connection()
-    if conn is None:
-        logger.error("init_db: cannot connect to DB")
+# -------------------- DB helpers (threaded) --------------------
+async def init_db_pool():
+    global db_pool
+    if db_pool:
         return
-    cur = None
-    try:
-        logger.debug("Creating tables and default buttons if needed")
-        cur = conn.cursor()
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS buttons (
-                id SERIAL PRIMARY KEY,
-                name TEXT NOT NULL,
-                callback_data TEXT UNIQUE NOT NULL,
-                parent_id INTEGER DEFAULT 0,
-                content_type TEXT,
-                file_id TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            );
-        """)
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS users (
-                user_id BIGINT PRIMARY KEY,
-                first_name TEXT,
-                last_name TEXT,
-                class_type TEXT,
-                registered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            );
-        """)
-        default_buttons = [
-            ("العلمي", "science", 0, None, None),
-            ("الأدبي", "literary", 0, None, None),
-            ("الإدارة", "admin_panel", 0, None, None),
-        ]
-        for name, cb, parent, ctype, fid in default_buttons:
-            cur.execute(
-                "INSERT INTO buttons (name, callback_data, parent_id, content_type, file_id) VALUES (%s,%s,%s,%s,%s) ON CONFLICT (callback_data) DO NOTHING",
-                (name, cb, parent, ctype, fid)
-            )
-        conn.commit()
-        logger.info("DB initialized with default buttons")
-    except Exception as e:
-        logger.exception("init_db error: %s", e)
-    finally:
-        try:
-            if cur:
-                cur.close()
-        except Exception:
-            pass
-        try:
-            conn.close()
-        except Exception:
-            pass
+    if not DATABASE_URL:
+        logger.error("DATABASE_URL not set; cannot initialize DB pool")
+        return
+    def create_pool():
+        result = urlparse(DATABASE_URL)
+        return ThreadedConnectionPool(
+            DB_POOL_MIN,
+            DB_POOL_MAX,
+            database=result.path[1:],
+            user=result.username,
+            password=result.password,
+            host=result.hostname,
+            port=result.port,
+        )
+    logger.info("Creating DB pool min=%s max=%s", DB_POOL_MIN, DB_POOL_MAX)
+    db_pool = await asyncio.to_thread(create_pool)
+    logger.info("DB pool created")
 
-def is_admin(user_id: int) -> bool:
-    return user_id in ADMIN_IDS
+async def run_db(fn: Callable):
+    """
+    Run provided function with a cursor in a thread.
+    The provided function must accept a single argument: cur (psycopg2 cursor).
+    The function may commit via cur.connection.commit() if needed.
+    """
+    if not db_pool:
+        await init_db_pool()
+    if not db_pool:
+        raise RuntimeError("DB pool is not available")
+    def thread_fn():
+        conn = db_pool.getconn()
+        try:
+            cur = conn.cursor()
+            try:
+                return fn(cur)
+            finally:
+                try:
+                    cur.close()
+                except Exception:
+                    pass
+        finally:
+            db_pool.putconn(conn)
+    return await asyncio.to_thread(thread_fn)
+
+async def db_fetchall(query: str, params: tuple = ()):
+    def fn(cur):
+        cur.execute(query, params)
+        return cur.fetchall()
+    return await run_db(fn)
+
+async def db_fetchone(query: str, params: tuple = ()):
+    def fn(cur):
+        cur.execute(query, params)
+        return cur.fetchone()
+    return await run_db(fn)
+
+async def db_execute(query: str, params: tuple = (), commit: bool = True) -> int:
+    def fn(cur):
+        cur.execute(query, params)
+        if commit:
+            cur.connection.commit()
+        return cur.rowcount
+    return await run_db(fn)
+
+# -------------------- Initialization (tables + defaults) --------------------
+async def init_db_schema_and_defaults():
+    # Create tables and insert default top-level buttons
+    logger.info("Initializing DB schema and default rows")
+    create_buttons = """
+    CREATE TABLE IF NOT EXISTS buttons (
+        id SERIAL PRIMARY KEY,
+        name TEXT NOT NULL,
+        callback_data TEXT UNIQUE NOT NULL,
+        parent_id INTEGER DEFAULT 0,
+        content_type TEXT,
+        file_id TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+    """
+    create_users = """
+    CREATE TABLE IF NOT EXISTS users (
+        user_id BIGINT PRIMARY KEY,
+        first_name TEXT,
+        last_name TEXT,
+        class_type TEXT,
+        registered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+    """
+    await db_execute(create_buttons, (), commit=True)
+    await db_execute(create_users, (), commit=True)
+    # default buttons
+    defaults = [
+        ("العلمي", "science", 0, None, None),
+        ("الأدبي", "literary", 0, None, None),
+        ("الإدارة", "admin_panel", 0, None, None),
+    ]
+    for name, cb, parent, ctype, fid in defaults:
+        await db_execute(
+            "INSERT INTO buttons (name, callback_data, parent_id, content_type, file_id) VALUES (%s,%s,%s,%s,%s) ON CONFLICT (callback_data) DO NOTHING",
+            (name, cb, parent, ctype, fid),
+            commit=True,
+        )
+    logger.info("DB schema and defaults ensured")
 
 # -------------------- UI builders --------------------
-def build_main_menu() -> Optional[InlineKeyboardMarkup]:
-    conn = get_db_connection()
-    if conn is None:
-        logger.error("build_main_menu: DB not available")
-        return None
-    cur = None
-    rows = []
-    try:
-        cur = conn.cursor()
-        cur.execute("SELECT name, callback_data FROM buttons WHERE parent_id = 0 ORDER BY id;")
-        rows = cur.fetchall()
-        logger.debug("Main menu buttons fetched: %s", rows)
-    except Exception as e:
-        logger.exception("Error fetching main buttons: %s", e)
-    finally:
-        try:
-            if cur:
-                cur.close()
-        except Exception:
-            pass
-        try:
-            conn.close()
-        except Exception:
-            pass
+def make_main_markup_from_rows(rows: List[tuple]) -> Optional[InlineKeyboardMarkup]:
     if not rows:
         return None
     keyboard = [[InlineKeyboardButton(name, callback_data=cb)] for name, cb in rows]
     return InlineKeyboardMarkup(keyboard)
+
+async def build_main_menu() -> Optional[InlineKeyboardMarkup]:
+    logger.debug("Fetching main menu buttons from DB")
+    try:
+        rows = await db_fetchall("SELECT name, callback_data FROM buttons WHERE parent_id = 0 ORDER BY id;")
+        logger.debug("Main menu rows=%s", rows)
+        return make_main_markup_from_rows(rows)
+    except Exception as e:
+        logger.exception("Failed to build main menu: %s", e)
+        return None
 
 def admin_panel_markup() -> InlineKeyboardMarkup:
     keyboard = [
@@ -178,26 +187,22 @@ def admin_panel_markup() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(keyboard)
 
 def missing_chats_markup() -> InlineKeyboardMarkup:
-    keyboard = [[InlineKeyboardButton("لقد انضممت — تحقق", callback_data="check_membership")]]
-    return InlineKeyboardMarkup(keyboard)
+    return InlineKeyboardMarkup([[InlineKeyboardButton("لقد انضممت — تحقق", callback_data="check_membership")]])
 
-# -------------------- Membership check (with logs) --------------------
+# -------------------- Membership check --------------------
 async def check_user_membership(user_id: int) -> Tuple[bool, List[str], Dict[str, str]]:
     """
     Returns (ok, missing_list, reasons)
-    reasons: human codes such as 'ok','bot_must_be_admin','bot_cannot_access_members',
-             'chat_not_found','user_not_member','bot_not_initialized','unknown_error'
+    reasons are codes: ok, bot_must_be_admin, bot_cannot_access_members, chat_not_found, user_not_member, bot_not_initialized, unknown_error
     """
-    missing = []
+    missing: List[str] = []
     reasons: Dict[str, str] = {}
-
-    logger.debug("Checking membership for user_id=%s required_chats=%s", user_id, REQUIRED_CHATS)
+    logger.debug("Checking membership for user=%s REQUIRED_CHATS=%s", user_id, REQUIRED_CHATS)
     if not REQUIRED_CHATS:
-        logger.debug("No REQUIRED_CHATS configured -> passing membership check")
+        logger.debug("No required chats configured -> membership ok")
         return True, missing, reasons
-
     if not bot:
-        logger.warning("Bot not initialized; cannot verify membership -> block by default")
+        logger.warning("Bot not initialized; cannot check membership")
         for c in REQUIRED_CHATS:
             missing.append(c)
             reasons[c] = "bot_not_initialized"
@@ -208,7 +213,7 @@ async def check_user_membership(user_id: int) -> Tuple[bool, List[str], Dict[str
         try:
             member = await bot.get_chat_member(chat_id=chat_ref, user_id=user_id)
             status = getattr(member, "status", None)
-            logger.info("getChatMember(%s, %s) -> status=%s", chat_ref, user_id, status)
+            logger.info("get_chat_member(%s,%s) -> status=%s", chat_ref, user_id, status)
             if status in ("member", "administrator", "creator"):
                 reasons[chat_ref] = "ok"
                 continue
@@ -217,8 +222,8 @@ async def check_user_membership(user_id: int) -> Tuple[bool, List[str], Dict[str
                 reasons[chat_ref] = "user_not_member"
         except Exception as e:
             txt = str(e)
+            logger.warning("get_chat_member failed for %s user=%s: %s", chat_ref, user_id, txt)
             missing.append(chat_ref)
-            logger.warning("getChatMember failed for %s user=%s: %s", chat_ref, user_id, txt)
             if "Chat_admin_required" in txt:
                 reasons[chat_ref] = "bot_must_be_admin"
             elif "Member list is inaccessible" in txt or "not enough rights" in txt:
@@ -231,36 +236,36 @@ async def check_user_membership(user_id: int) -> Tuple[bool, List[str], Dict[str
     logger.debug("Membership check result user=%s ok=%s missing=%s reasons=%s", user_id, ok, missing, reasons)
     return ok, missing, reasons
 
-# -------------------- Core processing --------------------
+# -------------------- Core message processing --------------------
 async def process_text_message(msg: dict):
-    """Handle message or edited_message dictionaries (admin flows + /start)."""
-    global admin_state, bot
-
+    """
+    Handle incoming message text and admin flows.
+    """
     text = msg.get("text") if isinstance(msg.get("text"), str) else None
     chat = msg.get("chat", {}) or {}
     chat_id = chat.get("id")
     from_user = msg.get("from", {}) or {}
     user_id = from_user.get("id")
 
-    logger.info("Processing text message from=%s text=%s chat_id=%s", user_id, text, chat_id)
+    logger.info("process_text_message user=%s chat=%s text=%s", user_id, chat_id, text)
 
     # ignore bots
     if isinstance(from_user, dict) and from_user.get("is_bot"):
-        logger.debug("Ignoring text from a bot account")
+        logger.debug("Ignoring message from bot account")
         return
-    if BOT_ID is not None and from_user.get("id") == BOT_ID:
-        logger.debug("Ignoring text from our own bot id")
+    if BOT_ID is not None and isinstance(from_user, dict) and from_user.get("id") == BOT_ID:
+        logger.debug("Ignoring message from this bot itself")
         return
 
-    # ADMIN flows handling
+    # admin flows in-memory (add/remove/upload)
     if user_id in admin_state:
         state = admin_state[user_id]
         action = state.get("action")
         logger.info("User %s in admin flow action=%s", user_id, action)
 
-        # ADD BUTTON
+        # add button: expects "name|parent_id"
         if action == "awaiting_add":
-            logger.debug("Admin %s submitting add button data: text=%s", user_id, text)
+            logger.debug("Admin %s submitting add data: %s", user_id, text)
             if not text or "|" not in text:
                 if bot and chat_id:
                     await bot.send_message(chat_id=chat_id, text="خطأ في الصيغة. استخدم: اسم الزر|رقم الأب (0 للقائمة الرئيسية)")
@@ -274,42 +279,25 @@ async def process_text_message(msg: dict):
                     await bot.send_message(chat_id=chat_id, text="رقم الأب يجب أن يكون عدداً صحيحاً.")
                 return
             callback_data = f"btn_{int(time.time())}_{name.replace(' ', '_')}"
-            conn = get_db_connection()
-            if conn is None:
-                logger.error("DB not available to add button")
-                if bot and chat_id:
-                    await bot.send_message(chat_id=chat_id, text="قاعدة البيانات غير متاحة.")
-                admin_state.pop(user_id, None)
-                return
-            cur = None
             try:
-                cur = conn.cursor()
-                cur.execute("INSERT INTO buttons (name, callback_data, parent_id) VALUES (%s, %s, %s)",
-                            (name, callback_data, parent_id))
-                conn.commit()
-                logger.info("Added button name=%s callback=%s parent=%s", name, callback_data, parent_id)
+                rowcount = await db_execute(
+                    "INSERT INTO buttons (name, callback_data, parent_id) VALUES (%s, %s, %s)",
+                    (name, callback_data, parent_id),
+                    commit=True
+                )
+                logger.info("Admin %s added button name=%s callback=%s parent=%s rowcount=%s", user_id, name, callback_data, parent_id, rowcount)
                 if bot and chat_id:
                     await bot.send_message(chat_id=chat_id, text=f"تم إضافة الزر '{name}' بنجاح! (الرمز: {callback_data})")
             except Exception as e:
                 logger.exception("Error adding button: %s", e)
                 if bot and chat_id:
                     await bot.send_message(chat_id=chat_id, text="حصل خطأ أثناء إضافة الزر.")
-            finally:
-                try:
-                    if cur:
-                        cur.close()
-                except Exception:
-                    pass
-                try:
-                    conn.close()
-                except Exception:
-                    pass
             admin_state.pop(user_id, None)
             return
 
-        # REMOVE BUTTON
+        # remove button: expects numeric id
         if action == "awaiting_remove":
-            logger.debug("Admin %s removing button id_text=%s", user_id, text)
+            logger.debug("Admin %s removing id_text=%s", user_id, text)
             if not text:
                 if bot and chat_id:
                     await bot.send_message(chat_id=chat_id, text="أرسل رقم الزر المراد حذفه.")
@@ -320,19 +308,9 @@ async def process_text_message(msg: dict):
                 if bot and chat_id:
                     await bot.send_message(chat_id=chat_id, text="يرجى إرسال رقم صحيح.")
                 return
-            conn = get_db_connection()
-            if conn is None:
-                if bot and chat_id:
-                    await bot.send_message(chat_id=chat_id, text="قاعدة البيانات غير متاحة.")
-                admin_state.pop(user_id, None)
-                return
-            cur = None
             try:
-                cur = conn.cursor()
-                cur.execute("DELETE FROM buttons WHERE id = %s", (bid,))
-                affected = cur.rowcount
-                conn.commit()
-                logger.info("Admin %s attempted delete button id=%s affected=%s", user_id, bid, affected)
+                affected = await db_execute("DELETE FROM buttons WHERE id = %s", (bid,), commit=True)
+                logger.info("Admin %s deleted button id=%s affected=%s", user_id, bid, affected)
                 if bot and chat_id:
                     if affected > 0:
                         await bot.send_message(chat_id=chat_id, text=f"تم حذف الزر بالمعرف {bid}.")
@@ -342,22 +320,12 @@ async def process_text_message(msg: dict):
                 logger.exception("Error removing button: %s", e)
                 if bot and chat_id:
                     await bot.send_message(chat_id=chat_id, text="حصل خطأ أثناء حذف الزر.")
-            finally:
-                try:
-                    if cur:
-                        cur.close()
-                except Exception:
-                    pass
-                try:
-                    conn.close()
-                except Exception:
-                    pass
             admin_state.pop(user_id, None)
             return
 
-        # AWAITING UPLOAD BUTTON ID
+        # awaiting upload target id
         if action == "awaiting_upload_button_id":
-            logger.debug("Admin %s provided upload target id text=%s", user_id, text)
+            logger.debug("Admin %s upload target id text=%s", user_id, text)
             if not text:
                 if bot and chat_id:
                     await bot.send_message(chat_id=chat_id, text="أرسل رقم الزر الذي تريد رفع الملف له.")
@@ -373,9 +341,9 @@ async def process_text_message(msg: dict):
                 await bot.send_message(chat_id=chat_id, text="الآن أرسل الملف (مستند/صورة/فيديو) أو نص لربطه بالزر.")
             return
 
-        # AWAITING UPLOAD FILE
+        # awaiting upload file
         if action == "awaiting_upload_file":
-            logger.debug("Admin %s uploading file in message; state=%s", user_id, state)
+            logger.debug("Admin %s upload file state=%s", user_id, state)
             target_bid = state.get("target_button_id")
             if not target_bid:
                 if bot and chat_id:
@@ -384,6 +352,8 @@ async def process_text_message(msg: dict):
                 return
             file_id = None
             content_type = None
+            # note: this function receives parsed update message dict; if it's coming from webhook,
+            # the media fields are present (document, photo, video)
             if msg.get("document"):
                 file_id = msg["document"].get("file_id")
                 content_type = "document"
@@ -400,19 +370,9 @@ async def process_text_message(msg: dict):
                 if bot and chat_id:
                     await bot.send_message(chat_id=chat_id, text="لم يتم العثور على ملف في هذه الرسالة. أرسل ملفاً أو نصاً.")
                 return
-            conn = get_db_connection()
-            if conn is None:
-                if bot and chat_id:
-                    await bot.send_message(chat_id=chat_id, text="قاعدة البيانات غير متاحة.")
-                admin_state.pop(user_id, None)
-                return
-            cur = None
             try:
-                cur = conn.cursor()
-                cur.execute("UPDATE buttons SET content_type = %s, file_id = %s WHERE id = %s",
-                            (content_type, file_id, target_bid))
-                affected = cur.rowcount
-                conn.commit()
+                affected = await db_execute("UPDATE buttons SET content_type=%s, file_id=%s WHERE id=%s",
+                                            (content_type, file_id, target_bid), commit=True)
                 logger.info("Admin %s updated button id=%s content=%s affected=%s", user_id, target_bid, content_type, affected)
                 if bot and chat_id:
                     if affected > 0:
@@ -423,25 +383,15 @@ async def process_text_message(msg: dict):
                 logger.exception("Error updating button content: %s", e)
                 if bot and chat_id:
                     await bot.send_message(chat_id=chat_id, text="حصل خطأ أثناء ربط الملف.")
-            finally:
-                try:
-                    if cur:
-                        cur.close()
-                except Exception:
-                    pass
-                try:
-                    conn.close()
-                except Exception:
-                    pass
             admin_state.pop(user_id, None)
             return
 
-    # Not admin flow: handle /start
+    # Not an admin flow -> handle /start (with membership check)
     if isinstance(text, str) and text.strip().lower().startswith("/start"):
-        logger.info("Received /start from user=%s chat=%s", user_id, chat_id)
+        logger.info("/start from user=%s chat=%s", user_id, chat_id)
         ok, missing, reasons = await check_user_membership(user_id)
         if not ok:
-            logger.info("User %s is missing required chats %s reasons=%s", user_id, missing, reasons)
+            logger.info("User %s missing required chats=%s reasons=%s", user_id, missing, reasons)
             lines = ["✋ قبل استخدام البوت، يلزم الانضمام إلى القنوات/المجموعة التالية:"]
             for c in missing:
                 r = reasons.get(c, "")
@@ -459,36 +409,21 @@ async def process_text_message(msg: dict):
             try:
                 if bot and chat_id:
                     await bot.send_message(chat_id=chat_id, text="\n".join(lines), reply_markup=missing_chats_markup())
-                    logger.debug("Sent missing-chats message to user=%s", user_id)
+                    logger.debug("Sent missing-chats instructions to user=%s", user_id)
             except Exception as e:
                 logger.exception("Failed to send missing-chats message: %s", e)
             return
 
-        # membership ok -> save user and show menu
-        conn = get_db_connection()
-        if conn:
-            cur = None
-            try:
-                cur = conn.cursor()
-                cur.execute("INSERT INTO users (user_id, first_name) VALUES (%s, %s) ON CONFLICT (user_id) DO NOTHING",
-                            (user_id, from_user.get("first_name", "")))
-                conn.commit()
-                logger.debug("Saved user to DB user_id=%s", user_id)
-            except Exception as e:
-                logger.exception("Error saving user: %s", e)
-            finally:
-                try:
-                    if cur:
-                        cur.close()
-                except Exception:
-                    pass
-                try:
-                    conn.close()
-                except Exception:
-                    pass
-
-        markup = build_main_menu()
+        # Save user to DB and show menu
         try:
+            await db_execute("INSERT INTO users (user_id, first_name) VALUES (%s,%s) ON CONFLICT (user_id) DO NOTHING",
+                             (user_id, from_user.get("first_name", "")), commit=True)
+            logger.debug("Saved user %s to DB", user_id)
+        except Exception as e:
+            logger.exception("Failed to save user: %s", e)
+
+        try:
+            markup = await build_main_menu()
             if bot and chat_id:
                 if markup:
                     await bot.send_message(chat_id=chat_id, text="مرحباً! اختر القسم المناسب:", reply_markup=markup)
@@ -507,12 +442,12 @@ async def root():
 
 @app.post("/webhook")
 async def webhook(request: Request):
-    # accept secret token header case-insensitively
+    # Accept header case-insensitively
     headers = {k.lower(): v for k, v in request.headers.items()}
     if WEBHOOK_SECRET_TOKEN:
         header_val = headers.get("x-telegram-bot-api-secret-token")
         if header_val != WEBHOOK_SECRET_TOKEN:
-            logger.warning("Invalid secret token header on incoming webhook (got=%s)", header_val)
+            logger.warning("Invalid secret token in incoming webhook request (got=%s)", header_val)
             raise HTTPException(status_code=403, detail="Invalid secret token")
 
     try:
@@ -521,32 +456,36 @@ async def webhook(request: Request):
         logger.exception("Failed to parse JSON from webhook: %s", e)
         raise HTTPException(status_code=400, detail="Invalid JSON")
 
-    logger.debug("Received update JSON: %s", update)
-
+    logger.debug("Incoming update JSON: %s", update)
     update_id = update.get("update_id")
     if update_id is not None:
         if update_id in PROCESSED_UPDATES:
-            logger.debug("Duplicate update_id=%s -> ignoring", update_id)
+            logger.debug("Duplicate update id=%s -> skipping", update_id)
             return JSONResponse({"ok": True})
         PROCESSED_UPDATES.append(update_id)
 
     logger.info("Incoming update id=%s keys=%s", update.get("update_id"), list(update.keys()))
 
-    # ignore updates from bots or our own bot id
-    try:
-        if "message" in update and isinstance(update["message"], dict):
-            frm = update["message"].get("from", {})
-            if isinstance(frm, dict) and frm.get("is_bot"):
-                logger.debug("Ignoring message from bot account.")
-                return JSONResponse({"ok": True})
-            if BOT_ID is not None and isinstance(frm, dict) and frm.get("id") == BOT_ID:
-                logger.debug("Ignoring message from our own bot id.")
-                return JSONResponse({"ok": True})
-    except Exception:
-        # don't let a small error prevent processing
-        logger.exception("Error checking message origin")
+    # Ignore updates from other bots or ourselves
+    if "message" in update and isinstance(update["message"], dict):
+        frm = update["message"].get("from", {})
+        if isinstance(frm, dict) and frm.get("is_bot"):
+            logger.debug("Ignoring message from a bot account")
+            return JSONResponse({"ok": True})
+        if BOT_ID is not None and isinstance(frm, dict) and frm.get("id") == BOT_ID:
+            logger.debug("Ignoring message from our own bot id")
+            return JSONResponse({"ok": True})
 
-    # callback_query handling
+    if "edited_message" in update and isinstance(update["edited_message"], dict):
+        frm = update["edited_message"].get("from", {})
+        if isinstance(frm, dict) and frm.get("is_bot"):
+            logger.debug("Ignoring edited_message from bot account")
+            return JSONResponse({"ok": True})
+        if BOT_ID is not None and isinstance(frm, dict) and frm.get("id") == BOT_ID:
+            logger.debug("Ignoring edited_message from our own bot id")
+            return JSONResponse({"ok": True})
+
+    # ---------------- callback_query handling ----------------
     if "callback_query" in update and isinstance(update["callback_query"], dict):
         cq = update["callback_query"]
         cq_id = cq.get("id")
@@ -557,10 +496,9 @@ async def webhook(request: Request):
         chat = message.get("chat", {}) or {}
         chat_id = chat.get("id")
         message_id = message.get("message_id")
+        logger.info("Callback query: user=%s data=%s chat=%s message_id=%s", user_id, data, chat_id, message_id)
 
-        logger.info("Callback query: user=%s data=%s chat_id=%s message_id=%s", user_id, data, chat_id, message_id)
-
-        # answerCallbackQuery quickly (log result)
+        # answer callback to stop spinner ASAP
         try:
             if bot and cq_id:
                 await bot.answer_callback_query(callback_query_id=cq_id)
@@ -568,30 +506,30 @@ async def webhook(request: Request):
         except Exception as e:
             logger.exception("answerCallbackQuery failed: %s", e)
 
-        # handle membership re-check
+        # membership re-check button
         if data == "check_membership":
             logger.info("User %s clicked check_membership", user_id)
             ok, missing, reasons = await check_user_membership(user_id)
-            logger.info("check_membership: ok=%s missing=%s reasons=%s", ok, missing, reasons)
+            logger.info("check_membership result ok=%s missing=%s reasons=%s", ok, missing, reasons)
             if ok:
                 try:
-                    markup = build_main_menu()
+                    markup = await build_main_menu()
                     if bot and chat_id and message_id:
-                        await bot.edit_message_text(chat_id=chat_id, message_id=message_id, text="شكرًا! تم التحقق — يمكنك الآن استخدام البوت:", reply_markup=markup)
-                        logger.debug("Edited membership message to show main menu for user=%s", user_id)
+                        await bot.edit_message_text(chat_id=chat_id, message_id=message_id,
+                                                    text="شكرًا! تم التحقق — يمكنك الآن استخدام البوت:",
+                                                    reply_markup=markup)
+                        logger.debug("Edited callback message to show main menu")
                     elif bot and chat_id:
                         await bot.send_message(chat_id=chat_id, text="شكرًا! تم التحقق — يمكنك الآن استخدام البوت:", reply_markup=markup)
-                        logger.debug("Sent membership success message to user=%s", user_id)
+                        logger.debug("Sent membership success message")
                 except Exception as e:
-                    logger.exception("Failed to show main menu after membership OK: %s", e)
+                    logger.exception("Failed to show main menu after membership ok: %s", e)
                     try:
                         if bot and chat_id:
                             await bot.send_message(chat_id=chat_id, text="شكرًا! تم التحقق — يمكنك الآن استخدام البوت:", reply_markup=markup)
-                            logger.debug("Fallback send_message after edit failure for user=%s", user_id)
-                    except Exception as e2:
-                        logger.exception("Fallback send_message also failed: %s", e2)
+                    except Exception:
+                        logger.exception("Fallback send_message failed")
             else:
-                # Build helpful reasons message
                 lines = ["✋ يلزم الانضمام أو إصلاح صلاحيات البوت في التالي:"]
                 for c in missing:
                     r = reasons.get(c, "")
@@ -608,282 +546,204 @@ async def webhook(request: Request):
                 lines.append("\nبعد التصحيح اضغط: 'لقد انضممت — تحقق' أو انتظر بضع ثوانٍ ثم حاول مرة أخرى.")
                 try:
                     if bot and chat_id and message_id:
-                        await bot.edit_message_text(chat_id=chat_id, message_id=message_id, text="\n".join(lines), reply_markup=missing_chats_markup())
-                        logger.debug("Edited message to show missing reasons for user=%s", user_id)
+                        await bot.edit_message_text(chat_id=chat_id, message_id=message_id, text="\n".join(lines),
+                                                    reply_markup=missing_chats_markup())
+                        logger.debug("Edited message to show missing reasons")
                     elif bot and chat_id:
                         await bot.send_message(chat_id=chat_id, text="\n".join(lines), reply_markup=missing_chats_markup())
-                        logger.debug("Sent missing reasons message to user=%s", user_id)
+                        logger.debug("Sent missing reasons message")
                 except Exception as e:
                     logger.exception("Failed to send missing reasons message: %s", e)
             return JSONResponse({"ok": True})
 
-        # ADMIN panel
+        # admin panel entry
         if data == "admin_panel":
             logger.info("User %s requested admin_panel", user_id)
-            if not is_admin(user_id):
+            if not (user_id in ADMIN_IDS):
                 try:
                     if bot and cq_id:
                         await bot.answer_callback_query(callback_query_id=cq_id, text="ليس لديك صلاحية للوصول إلى هذه الصفحة.")
-                        logger.debug("Told user %s they are not admin", user_id)
                 except Exception:
                     logger.exception("Failed to answer unauthorized admin_panel")
                 return JSONResponse({"ok": True})
             try:
                 if bot and chat_id and message_id:
                     await bot.edit_message_text(chat_id=chat_id, message_id=message_id, text="لوحة تحكم المشرف:", reply_markup=admin_panel_markup())
-                    logger.debug("Displayed admin panel to admin %s", user_id)
                 elif bot and chat_id:
                     await bot.send_message(chat_id=chat_id, text="لوحة تحكم المشرف:", reply_markup=admin_panel_markup())
-                    logger.debug("Sent admin panel to admin %s via send_message", user_id)
+                logger.debug("Displayed admin panel to admin %s", user_id)
             except Exception as e:
                 logger.exception("Failed to show admin panel: %s", e)
             return JSONResponse({"ok": True})
 
-        # Admin actions / list / add / remove / upload are handled in other branches below
-        # Admin: add button
+        # admin actions
         if data == "admin_add_button":
-            logger.info("Admin %s clicked add_button", user_id)
-            if is_admin(user_id):
+            if user_id in ADMIN_IDS:
                 admin_state[user_id] = {"action": "awaiting_add"}
                 try:
                     if bot and chat_id:
                         await bot.send_message(chat_id=chat_id, text="أرسل اسم الزر الجديد ورقم الزر الأب بالصيغة:\nاسم الزر|رقم الأب (0 للقائمة الرئيسية)")
-                        logger.debug("Sent add-button instruction to admin %s", user_id)
-                except Exception as e:
-                    logger.exception("Failed to send admin add instruction: %s", e)
+                except Exception:
+                    logger.exception("Failed to send admin add instruction")
             return JSONResponse({"ok": True})
 
         if data == "admin_remove_button":
-            logger.info("Admin %s clicked remove_button", user_id)
-            if is_admin(user_id):
+            if user_id in ADMIN_IDS:
                 admin_state[user_id] = {"action": "awaiting_remove"}
                 try:
                     if bot and chat_id:
                         await bot.send_message(chat_id=chat_id, text="أرسل رقم الزر الذي تريد حذفه (انظر 'عرض جميع الأزرار').")
-                        logger.debug("Sent remove-button instruction to admin %s", user_id)
-                except Exception as e:
-                    logger.exception("Failed to send admin remove instruction: %s", e)
+                except Exception:
+                    logger.exception("Failed to send admin remove instruction")
             return JSONResponse({"ok": True})
 
         if data == "admin_upload_to_button":
-            logger.info("Admin %s clicked upload_to_button", user_id)
-            if is_admin(user_id):
+            if user_id in ADMIN_IDS:
                 admin_state[user_id] = {"action": "awaiting_upload_button_id"}
                 try:
                     if bot and chat_id:
                         await bot.send_message(chat_id=chat_id, text="أرسل رقم الزر الذي تريد رفع الملف له ثم أرسل الملف بعد ذلك.")
-                        logger.debug("Sent upload-button instruction to admin %s", user_id)
-                except Exception as e:
-                    logger.exception("Failed to send admin upload instruction: %s", e)
+                except Exception:
+                    logger.exception("Failed to send admin upload instruction")
             return JSONResponse({"ok": True})
 
         if data == "admin_list_buttons":
-            logger.info("Admin %s clicked list_buttons", user_id)
-            if is_admin(user_id):
-                conn = get_db_connection()
-                if conn is None:
-                    try:
-                        if bot and chat_id:
-                            await bot.send_message(chat_id=chat_id, text="قاعدة البيانات غير متاحة.")
-                            logger.debug("Told admin %s DB unavailable", user_id)
-                    except Exception:
-                        logger.exception("Failed to notify admin of DB issue")
-                    return JSONResponse({"ok": True})
-                cur = None
+            if user_id in ADMIN_IDS:
                 try:
-                    cur = conn.cursor()
-                    cur.execute("SELECT id, name, callback_data, parent_id FROM buttons ORDER BY id;")
-                    rows = cur.fetchall()
+                    rows = await db_fetchall("SELECT id, name, callback_data, parent_id FROM buttons ORDER BY id;")
                     lines = ["جميع الأزرار:"]
                     for r in rows:
                         lines.append(f"{r[0]}: {r[1]} (رمز: {r[2]}, أب: {r[3]})")
                     if bot and chat_id:
                         await bot.send_message(chat_id=chat_id, text="\n".join(lines))
-                        logger.debug("Sent admin list to %s", user_id)
                 except Exception as e:
                     logger.exception("admin_list_buttons error: %s", e)
                     try:
                         if bot and chat_id:
                             await bot.send_message(chat_id=chat_id, text="حصل خطأ أثناء جلب الأزرار.")
                     except Exception:
-                        logger.exception("Failed to send admin error message")
-                finally:
-                    try:
-                        if cur:
-                            cur.close()
-                    except Exception:
-                        pass
-                    try:
-                        conn.close()
-                    except Exception:
-                        pass
+                        logger.exception("Failed to notify admin of error")
             return JSONResponse({"ok": True})
 
         if data == "back_to_main":
-            logger.info("User %s clicked back_to_main", user_id)
             try:
+                markup = await build_main_menu()
                 if bot and chat_id and message_id:
-                    await bot.edit_message_text(chat_id=chat_id, message_id=message_id, text="مرحباً! اختر القسم المناسب:", reply_markup=build_main_menu())
-                    logger.debug("Back to main via edit for user %s", user_id)
+                    await bot.edit_message_text(chat_id=chat_id, message_id=message_id, text="مرحباً! اختر القسم المناسب:", reply_markup=markup)
                 elif bot and chat_id:
-                    await bot.send_message(chat_id=chat_id, text="مرحباً! اختر القسم المناسب:", reply_markup=build_main_menu())
-                    logger.debug("Back to main via send for user %s", user_id)
+                    await bot.send_message(chat_id=chat_id, text="مرحباً! اختر القسم المناسب:", reply_markup=markup)
+                logger.debug("Back to main for user %s", user_id)
             except Exception as e:
                 logger.exception("back_to_main error: %s", e)
             return JSONResponse({"ok": True})
 
-        # Regular button handling (DB-backed)
-        logger.debug("Handling regular button callback data=%s", data)
-        conn = get_db_connection()
-        if conn is None:
-            logger.error("DB not available while handling button callback")
-            try:
-                if bot and chat_id:
-                    await bot.send_message(chat_id=chat_id, text="خدمة غير متاحة الآن.")
-            except Exception:
-                logger.exception("Failed to notify user about DB unavailability")
-            return JSONResponse({"ok": True})
-        cur = None
+        # Regular button callback handling: check DB for content or submenu
         try:
-            cur = conn.cursor()
-            cur.execute("SELECT content_type, file_id, id FROM buttons WHERE callback_data = %s", (data,))
-            row = cur.fetchone()
-            logger.debug("DB query for button callback returned: %s", row)
+            row = await db_fetchone("SELECT content_type, file_id, id FROM buttons WHERE callback_data = %s", (data,))
+            logger.debug("Button lookup for data=%s -> %s", data, row)
         except Exception as e:
-            logger.exception("DB error getting button: %s", e)
+            logger.exception("DB error while fetching button: %s", e)
             row = None
-        finally:
-            try:
-                if cur:
-                    cur.close()
-            except Exception:
-                pass
-            try:
-                conn.close()
-            except Exception:
-                pass
 
         if row and row[0] and row[1]:
-            ctype, fid, _ = row
+            ctype, fid, _id = row
             try:
                 if ctype == "document":
                     await bot.send_document(chat_id=chat_id, document=fid)
-                    logger.info("Sent document fid=%s to chat=%s", fid, chat_id)
                 elif ctype == "photo":
                     await bot.send_photo(chat_id=chat_id, photo=fid)
-                    logger.info("Sent photo fid=%s to chat=%s", fid, chat_id)
                 elif ctype == "video":
                     await bot.send_video(chat_id=chat_id, video=fid)
-                    logger.info("Sent video fid=%s to chat=%s", fid, chat_id)
                 else:
                     await bot.send_message(chat_id=chat_id, text=str(fid))
-                    logger.info("Sent text content for button to chat=%s", chat_id)
             except Exception as e:
                 logger.exception("Error sending button content: %s", e)
             return JSONResponse({"ok": True})
 
-        # Show submenu
-        conn = get_db_connection()
-        if conn is None:
-            return JSONResponse({"ok": True})
-        cur = None
+        # show submenu if any
         try:
-            cur = conn.cursor()
-            cur.execute("SELECT id FROM buttons WHERE callback_data = %s", (data,))
-            parent_row = cur.fetchone()
+            parent_row = await db_fetchone("SELECT id FROM buttons WHERE callback_data = %s", (data,))
             if not parent_row:
-                logger.info("Button callback_data=%s not found in DB", data)
                 if bot and chat_id:
                     await bot.send_message(chat_id=chat_id, text="الزر غير موجود.")
+                logger.info("Callback data not found in DB: %s", data)
                 return JSONResponse({"ok": True})
             parent_id = parent_row[0]
-            cur.execute("SELECT name, callback_data FROM buttons WHERE parent_id = %s", (parent_id,))
-            subs = cur.fetchall()
-            logger.debug("Submenu items for parent_id=%s: %s", parent_id, subs)
+            subs = await db_fetchall("SELECT name, callback_data FROM buttons WHERE parent_id = %s", (parent_id,))
+            if subs:
+                keyboard = [[InlineKeyboardButton(name, callback_data=cb)] for name, cb in subs]
+                keyboard.append([InlineKeyboardButton("العودة", callback_data="back_to_main")])
+                reply_markup = InlineKeyboardMarkup(keyboard)
+                try:
+                    if bot and chat_id and message_id:
+                        await bot.edit_message_text(chat_id=chat_id, message_id=message_id, text="اختر من القائمة:", reply_markup=reply_markup)
+                    elif bot and chat_id:
+                        await bot.send_message(chat_id=chat_id, text="اختر من القائمة:", reply_markup=reply_markup)
+                except Exception as e:
+                    logger.exception("Failed to show submenu: %s", e)
+            else:
+                try:
+                    if bot and chat_id:
+                        await bot.send_message(chat_id=chat_id, text="هذه القائمة لا تحتوي على محتوى بعد.")
+                except Exception:
+                    logger.exception("Failed to notify empty submenu")
         except Exception as e:
-            logger.exception("DB error fetching submenu: %s", e)
-            subs = []
-        finally:
-            try:
-                if cur:
-                    cur.close()
-            except Exception:
-                pass
-            try:
-                conn.close()
-            except Exception:
-                pass
-
-        if subs:
-            keyboard = [[InlineKeyboardButton(name, callback_data=cb)] for name, cb in subs]
-            keyboard.append([InlineKeyboardButton("العودة", callback_data="back_to_main")])
-            reply_markup = InlineKeyboardMarkup(keyboard)
-            try:
-                if bot and chat_id and message_id:
-                    await bot.edit_message_text(chat_id=chat_id, message_id=message_id, text="اختر من القائمة:", reply_markup=reply_markup)
-                    logger.debug("Edited message to show submenu for user=%s", user_id)
-                elif bot and chat_id:
-                    await bot.send_message(chat_id=chat_id, text="اختر من القائمة:", reply_markup=reply_markup)
-                    logger.debug("Sent submenu message to user=%s", user_id)
-            except Exception as e:
-                logger.exception("Failed to show submenu: %s", e)
-        else:
-            try:
-                if bot and chat_id:
-                    await bot.send_message(chat_id=chat_id, text="هذه القائمة لا تحتوي على محتوى بعد.")
-                    logger.debug("Told user=%s submenu empty", user_id)
-            except Exception:
-                logger.exception("Failed to notify user about empty submenu")
+            logger.exception("DB error fetching submenu for callback %s: %s", data, e)
         return JSONResponse({"ok": True})
 
-    # message / edited_message handling
+    # ---------------- message / edited_message handling ----------------
     if "message" in update and isinstance(update["message"], dict):
-        logger.debug("Processing update.message")
         try:
             await process_text_message(update["message"])
         except Exception as e:
             logger.exception("Unhandled exception in process_text_message: %s", e)
-            # notify admins of the exception
+            # notify admins
             if bot and ADMIN_IDS:
                 try:
                     for admin in ADMIN_IDS:
                         await bot.send_message(chat_id=admin, text=f"Error processing message update: {e}")
                 except Exception:
-                    logger.exception("Failed to notify admins about exception")
+                    logger.exception("Failed to notify admins")
         return JSONResponse({"ok": True})
 
     if "edited_message" in update and isinstance(update["edited_message"], dict):
-        logger.debug("Processing update.edited_message")
         try:
             await process_text_message(update["edited_message"])
         except Exception as e:
             logger.exception("Unhandled exception in process_text_message (edited): %s", e)
         return JSONResponse({"ok": True})
 
-    logger.debug("No actionable fields in update; acking")
+    logger.debug("No actionable update fields; acking")
     return JSONResponse({"ok": True})
 
 # -------------------- Startup / Shutdown --------------------
 @app.on_event("startup")
 async def on_startup():
     global bot, BOT_ID
-    logger.info("Startup: initializing DB and bot")
+    logger.info("Startup: initializing DB pool and bot")
     if not BOT_TOKEN or not DATABASE_URL:
         logger.error("Missing BOT_TOKEN or DATABASE_URL; bot will not be fully initialized")
         return
 
-    init_db()
+    # Create DB pool and schema
+    try:
+        await init_db_pool()
+        await init_db_schema_and_defaults()
+    except Exception as e:
+        logger.exception("Failed to init DB pool or schema: %s", e)
 
+    # Init bot
     try:
         bot = Bot(token=BOT_TOKEN)
         me = await bot.get_me()
         BOT_ID = getattr(me, "id", None)
-        logger.info("Bot initialized id=%s username=%s", BOT_ID, getattr(me, "username", None))
+        logger.info("Bot ready id=%s username=%s", BOT_ID, getattr(me, "username", None))
     except Exception as e:
-        logger.exception("Failed to initialize Bot instance: %s", e)
+        logger.exception("Failed to initialize Bot: %s", e)
         bot = None
         BOT_ID = None
 
+    # register webhook if URL provided
     if WEBHOOK_URL and bot:
         webhook_target = WEBHOOK_URL.rstrip("/") + "/webhook"
         try:
@@ -894,11 +754,11 @@ async def on_startup():
             logger.info("set_webhook result: %s", res)
             try:
                 info = await bot.get_webhook_info()
-                logger.info("getWebhookInfo: %s", info)
-            except Exception as e:
-                logger.exception("Failed to call getWebhookInfo: %s", e)
-        except Exception as e:
-            logger.exception("Failed to set webhook: %s", e)
+                logger.info("webhook_info: %s", info)
+            except Exception:
+                logger.exception("Failed to get webhook_info")
+        except Exception:
+            logger.exception("Failed to set webhook")
     else:
         if not WEBHOOK_URL:
             logger.warning("WEBHOOK_URL not set; webhook won't be auto-registered")
@@ -907,14 +767,20 @@ async def on_startup():
 
 @app.on_event("shutdown")
 async def on_shutdown():
-    global bot
+    global bot, db_pool
     logger.info("Shutdown: cleaning up")
     if bot and WEBHOOK_URL:
         try:
             await bot.delete_webhook()
-            logger.info("Webhook deleted at shutdown")
+            logger.info("Webhook deleted")
         except Exception:
-            logger.exception("Failed to delete webhook at shutdown")
+            logger.exception("Failed to delete webhook")
+    if db_pool:
+        try:
+            db_pool.closeall()
+            logger.info("Closed DB pool")
+        except Exception:
+            logger.exception("Failed to close DB pool")
 
 # -------------------- Entrypoint --------------------
 def main():
