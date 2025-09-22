@@ -541,7 +541,7 @@ async def webhook(request: Request):
                 return JSONResponse({"ok": True})
             if BOT_ID is not None and isinstance(frm, dict) and frm.get("id") == BOT_ID:
                 logger.debug("Ignoring message from our own bot id.")
-                return JSONResponse({"ok": True)
+                return JSONResponse({"ok": True})
     except Exception:
         # don't let a small error prevent processing
         logger.exception("Error checking message origin")
