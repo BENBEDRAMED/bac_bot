@@ -38,7 +38,7 @@ BOT_ID: Optional[int] = None
 # small in-memory dedupe of update_id to avoid double-processing retries
 PROCESSED_UPDATES = deque(maxlen=5000)
 
-# admin workflow state (in-memory). For multi-instance real deployments, persist it.
+# admin workflow state (in-memory). For multi-instance deployments persist it in DB.
 admin_state: Dict[int, Dict[str, Any]] = {}  # user_id -> {"action":..., ...}
 
 # ------------------ DB helpers ------------------
@@ -115,7 +115,10 @@ def init_db():
             cur.close()
         except Exception:
             pass
-        conn.close()
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
@@ -125,6 +128,7 @@ def build_main_menu() -> Optional[InlineKeyboardMarkup]:
     conn = get_db_connection()
     if conn is None:
         return None
+    rows = []
     try:
         cur = conn.cursor()
         cur.execute("SELECT name, callback_data FROM buttons WHERE parent_id = 0 ORDER BY id;")
@@ -132,7 +136,6 @@ def build_main_menu() -> Optional[InlineKeyboardMarkup]:
         cur.close()
     except Exception as e:
         logger.exception("Error fetching main buttons: %s", e)
-        rows = []
     finally:
         try:
             conn.close()
@@ -188,46 +191,54 @@ async def process_text_message(msg: dict):
         # Add button flow
         if action == "awaiting_add":
             if not text or "|" not in text:
-                await bot.send_message(chat_id=chat_id, text="خطأ في الصيغة. استخدم: اسم الزر|رقم الأب (0 للقائمة الرئيسية)")
+                if bot and chat_id:
+                    await bot.send_message(chat_id=chat_id, text="خطأ في الصيغة. استخدم: اسم الزر|رقم الأب (0 للقائمة الرئيسية)")
                 return
             name_part, parent_part = text.split("|", 1)
             name = name_part.strip()
             try:
                 parent_id = int(parent_part.strip())
             except ValueError:
-                await bot.send_message(chat_id=chat_id, text="رقم الأب يجب أن يكون عدداً صحيحاً.")
+                if bot and chat_id:
+                    await bot.send_message(chat_id=chat_id, text="رقم الأب يجب أن يكون عدداً صحيحاً.")
                 return
             callback_data = f"btn_{int(time.time())}_{name.replace(' ', '_')}"
             conn = get_db_connection()
             if conn:
                 try:
                     cur = conn.cursor()
-                    cur.execute("INSERT INTO buttons (name, callback_data, parent_id) VALUES (%s, %s, %s)", (name, callback_data, parent_id))
+                    cur.execute("INSERT INTO buttons (name, callback_data, parent_id) VALUES (%s, %s, %s)",
+                                (name, callback_data, parent_id))
                     conn.commit()
                     cur.close()
-                    await bot.send_message(chat_id=chat_id, text=f"تم إضافة الزر '{name}' بنجاح! (الرمز: {callback_data})")
+                    if bot and chat_id:
+                        await bot.send_message(chat_id=chat_id, text=f"تم إضافة الزر '{name}' بنجاح! (الرمز: {callback_data})")
                 except Exception as e:
                     logger.exception("Error adding button: %s", e)
-                    await bot.send_message(chat_id=chat_id, text="حصل خطأ أثناء إضافة الزر.")
+                    if bot and chat_id:
+                        await bot.send_message(chat_id=chat_id, text="حصل خطأ أثناء إضافة الزر.")
                 finally:
                     try:
                         conn.close()
                     except Exception:
                         pass
             else:
-                await bot.send_message(chat_id=chat_id, text="قاعدة البيانات غير متاحة.")
+                if bot and chat_id:
+                    await bot.send_message(chat_id=chat_id, text="قاعدة البيانات غير متاحة.")
             admin_state.pop(user_id, None)
             return
 
         # Remove button flow
         if action == "awaiting_remove":
             if not text:
-                await bot.send_message(chat_id=chat_id, text="أرسل رقم الزر المراد حذفه.")
+                if bot and chat_id:
+                    await bot.send_message(chat_id=chat_id, text="أرسل رقم الزر المراد حذفه.")
                 return
             try:
                 bid = int(text.strip())
             except ValueError:
-                await bot.send_message(chat_id=chat_id, text="يرجى إرسال رقم صحيح.")
+                if bot and chat_id:
+                    await bot.send_message(chat_id=chat_id, text="يرجى إرسال رقم صحيح.")
                 return
             conn = get_db_connection()
             if conn:
@@ -237,42 +248,49 @@ async def process_text_message(msg: dict):
                     affected = cur.rowcount
                     conn.commit()
                     cur.close()
-                    if affected > 0:
-                        await bot.send_message(chat_id=chat_id, text=f"تم حذف الزر بالمعرف {bid}.")
-                    else:
-                        await bot.send_message(chat_id=chat_id, text="لم يتم العثور على الزر المحدد.")
+                    if bot and chat_id:
+                        if affected > 0:
+                            await bot.send_message(chat_id=chat_id, text=f"تم حذف الزر بالمعرف {bid}.")
+                        else:
+                            await bot.send_message(chat_id=chat_id, text="لم يتم العثور على الزر المحدد.")
                 except Exception as e:
                     logger.exception("Error removing button: %s", e)
-                    await bot.send_message(chat_id=chat_id, text="حصل خطأ أثناء حذف الزر.")
+                    if bot and chat_id:
+                        await bot.send_message(chat_id=chat_id, text="حصل خطأ أثناء حذف الزر.")
                 finally:
                     try:
                         conn.close()
                     except Exception:
                         pass
             else:
-                await bot.send_message(chat_id=chat_id, text="قاعدة البيانات غير متاحة.")
+                if bot and chat_id:
+                    await bot.send_message(chat_id=chat_id, text="قاعدة البيانات غير متاحة.")
             admin_state.pop(user_id, None)
             return
 
         # Upload target id flow
         if action == "awaiting_upload_button_id":
             if not text:
-                await bot.send_message(chat_id=chat_id, text="أرسل رقم الزر الذي تريد رفع الملف له.")
+                if bot and chat_id:
+                    await bot.send_message(chat_id=chat_id, text="أرسل رقم الزر الذي تريد رفع الملف له.")
                 return
             try:
                 bid = int(text.strip())
             except ValueError:
-                await bot.send_message(chat_id=chat_id, text="يرجى إرسال رقم صحيح.")
+                if bot and chat_id:
+                    await bot.send_message(chat_id=chat_id, text="يرجى إرسال رقم صحيح.")
                 return
             admin_state[user_id] = {"action": "awaiting_upload_file", "target_button_id": bid}
-            await bot.send_message(chat_id=chat_id, text="الآن أرسل الملف (مستند/صورة/فيديو) أو نص لربطه بالزر.")
+            if bot and chat_id:
+                await bot.send_message(chat_id=chat_id, text="الآن أرسل الملف (مستند/صورة/فيديو) أو نص لربطه بالزر.")
             return
 
         # Upload file flow
         if action == "awaiting_upload_file":
             target_bid = state.get("target_button_id")
             if not target_bid:
-                await bot.send_message(chat_id=chat_id, text="لم يتم تحديد الزر الهدف. أعد العملية.")
+                if bot and chat_id:
+                    await bot.send_message(chat_id=chat_id, text="لم يتم تحديد الزر الهدف. أعد العملية.")
                 admin_state.pop(user_id, None)
                 return
             file_id = None
@@ -291,31 +309,36 @@ async def process_text_message(msg: dict):
                 content_type = "text"
 
             if not file_id:
-                await bot.send_message(chat_id=chat_id, text="لم يتم العثور على ملف في هذه الرسالة. أرسل ملفاً أو نصاً.")
+                if bot and chat_id:
+                    await bot.send_message(chat_id=chat_id, text="لم يتم العثور على ملف في هذه الرسالة. أرسل ملفاً أو نصاً.")
                 return
 
             conn = get_db_connection()
             if conn:
                 try:
                     cur = conn.cursor()
-                    cur.execute("UPDATE buttons SET content_type = %s, file_id = %s WHERE id = %s", (content_type, file_id, target_bid))
+                    cur.execute("UPDATE buttons SET content_type = %s, file_id = %s WHERE id = %s",
+                                (content_type, file_id, target_bid))
                     affected = cur.rowcount
                     conn.commit()
                     cur.close()
-                    if affected > 0:
-                        await bot.send_message(chat_id=chat_id, text="تم ربط الملف بالزر بنجاح!")
-                    else:
-                        await bot.send_message(chat_id=chat_id, text="لم يتم العثور على الزر المحدد.")
+                    if bot and chat_id:
+                        if affected > 0:
+                            await bot.send_message(chat_id=chat_id, text="تم ربط الملف بالزر بنجاح!")
+                        else:
+                            await bot.send_message(chat_id=chat_id, text="لم يتم العثور على الزر المحدد.")
                 except Exception as e:
                     logger.exception("Error updating button content: %s", e)
-                    await bot.send_message(chat_id=chat_id, text="حصل خطأ أثناء ربط الملف.")
+                    if bot and chat_id:
+                        await bot.send_message(chat_id=chat_id, text="حصل خطأ أثناء ربط الملف.")
                 finally:
                     try:
                         conn.close()
                     except Exception:
                         pass
             else:
-                await bot.send_message(chat_id=chat_id, text="قاعدة البيانات غير متاحة.")
+                if bot and chat_id:
+                    await bot.send_message(chat_id=chat_id, text="قاعدة البيانات غير متاحة.")
             admin_state.pop(user_id, None)
             return
 
@@ -326,8 +349,10 @@ async def process_text_message(msg: dict):
         if conn:
             try:
                 cur = conn.cursor()
-                cur.execute("INSERT INTO users (user_id, first_name) VALUES (%s, %s) ON CONFLICT (user_id) DO NOTHING",
-                            (user_id, from_user.get("first_name", "")))
+                cur.execute(
+                    "INSERT INTO users (user_id, first_name) VALUES (%s, %s) ON CONFLICT (user_id) DO NOTHING",
+                    (user_id, from_user.get("first_name", ""))
+                )
                 conn.commit()
                 cur.close()
             except Exception:
@@ -388,8 +413,7 @@ async def webhook(request: Request):
         frm = update["edited_message"].get("from", {})
         if isinstance(frm, dict) and frm.get("is_bot"):
             logger.debug("Ignoring edited_message from bot account.")
-            return JSONResponse({"ok": True)
-)
+            return JSONResponse({"ok": True})
         if BOT_ID is not None and isinstance(frm, dict) and frm.get("id") == BOT_ID:
             logger.debug("Ignoring edited_message from our own bot id.")
             return JSONResponse({"ok": True})
