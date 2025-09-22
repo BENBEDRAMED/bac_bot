@@ -32,9 +32,9 @@ REQUIRED_CHATS_RAW = os.environ.get("REQUIRED_CHATS", "")
 REQUIRED_CHATS: List[str] = [c.strip() for c in REQUIRED_CHATS_RAW.split(",") if c.strip()]
 
 PORT = int(os.environ.get("PORT", 10000))
-DB_POOL_MAX = int(os.environ.get("DB_POOL_MAX", 10))
-MAX_CONCURRENT = int(os.environ.get("MAX_CONCURRENT", 80))
-PROCESSING_SEMAPHORE_TIMEOUT = float(os.environ.get("PROCESSING_SEMAPHORE_TIMEOUT", 2.0))
+DB_POOL_MAX = int(os.environ.get("DB_POOL_MAX", 20))  # Increased from 10
+MAX_CONCURRENT = int(os.environ.get("MAX_CONCURRENT", 50))  # Reduced from 80
+PROCESSING_SEMAPHORE_TIMEOUT = float(os.environ.get("PROCESSING_SEMAPHORE_TIMEOUT", 5.0))
 
 # ---------------- Globals ----------------
 app = FastAPI()
@@ -47,6 +47,18 @@ admin_state: Dict[int, Dict[str, Any]] = {}
 
 PROCESSING_SEMAPHORE = asyncio.BoundedSemaphore(MAX_CONCURRENT)
 
+# ---------------- Safe Telegram API calls ----------------
+async def safe_telegram_call(coro, timeout=30):
+    """Execute Telegram API call with timeout"""
+    try:
+        return await asyncio.wait_for(coro, timeout=timeout)
+    except asyncio.TimeoutError:
+        logger.error("Telegram API call timed out after %s seconds", timeout)
+        raise
+    except Exception as e:
+        logger.error("Telegram API call failed: %s", e)
+        raise
+
 # ---------------- DB helpers (asyncpg) ----------------
 async def init_pg_pool():
     global pg_pool
@@ -56,26 +68,72 @@ async def init_pg_pool():
         logger.error("DATABASE_URL not set, cannot create pool")
         return
     logger.info("Creating asyncpg pool max_size=%s", DB_POOL_MAX)
-    pg_pool = await asyncpg.create_pool(dsn=DATABASE_URL, max_size=DB_POOL_MAX)
+    pg_pool = await asyncpg.create_pool(
+        dsn=DATABASE_URL, 
+        max_size=DB_POOL_MAX,
+        command_timeout=60,  # 60 second timeout for queries
+        timeout=30  # 30 second timeout for connection acquisition
+    )
     logger.info("Postgres pool created")
 
 async def db_fetchall(query: str, *params):
     if not pg_pool:
         raise RuntimeError("DB pool not initialized")
     async with pg_pool.acquire() as conn:
-        return await conn.fetch(query, *params)
+        try:
+            return await conn.fetch(query, *params)
+        except Exception as e:
+            logger.error("Database query failed: %s", e)
+            raise
 
 async def db_fetchone(query: str, *params):
     if not pg_pool:
         raise RuntimeError("DB pool not initialized")
     async with pg_pool.acquire() as conn:
-        return await conn.fetchrow(query, *params)
+        try:
+            return await conn.fetchrow(query, *params)
+        except Exception as e:
+            logger.error("Database query failed: %s", e)
+            raise
 
 async def db_execute(query: str, *params):
     if not pg_pool:
         raise RuntimeError("DB pool not initialized")
     async with pg_pool.acquire() as conn:
-        return await conn.execute(query, *params)
+        try:
+            return await conn.execute(query, *params)
+        except Exception as e:
+            logger.error("Database execute failed: %s", e)
+            raise
+
+# ---------------- Health check ----------------
+async def check_db_health():
+    """Check if database connection is healthy"""
+    if not pg_pool:
+        return False
+    try:
+        async with pg_pool.acquire() as conn:
+            await conn.execute("SELECT 1")
+        return True
+    except Exception as e:
+        logger.error("Database health check failed: %s", e)
+        return False
+
+@app.get("/health")
+async def health_check():
+    """Health check endpoint"""
+    db_healthy = await check_db_health()
+    bot_healthy = bot is not None and BOT_ID is not None
+    
+    status_code = 200 if db_healthy and bot_healthy else 503
+    return JSONResponse({
+        "status": "healthy" if status_code == 200 else "unhealthy",
+        "database": "connected" if db_healthy else "disconnected",
+        "bot": "connected" if bot_healthy else "disconnected",
+        "concurrent_requests": MAX_CONCURRENT - PROCESSING_SEMAPHORE._value,
+        "max_concurrent": MAX_CONCURRENT,
+        "timestamp": time.time()
+    }, status_code=status_code)
 
 # ---------------- Init schema and defaults ----------------
 async def init_db_schema_and_defaults():
@@ -159,7 +217,7 @@ async def check_user_membership(user_id: int) -> Tuple[bool, List[str], Dict[str
         return False, missing, reasons
     for chat_ref in REQUIRED_CHATS:
         try:
-            member = await bot.get_chat_member(chat_id=chat_ref, user_id=user_id)
+            member = await safe_telegram_call(bot.get_chat_member(chat_id=chat_ref, user_id=user_id))
             status = getattr(member, "status", None)
             logger.info("get_chat_member(%s,%s) -> %s", chat_ref, user_id, status)
             if status in ("member", "administrator", "creator"):
@@ -208,7 +266,7 @@ async def process_text_message(msg: dict):
         if action == "awaiting_add":
             if not text or "|" not in text:
                 if bot and chat_id:
-                    await bot.send_message(chat_id=chat_id, text="خطأ في الصيغة. استخدم: اسم الزر|رقم الأب (0 للقائمة الرئيسية)")
+                    await safe_telegram_call(bot.send_message(chat_id=chat_id, text="خطأ في الصيغة. استخدم: اسم الزر|رقم الأب (0 للقائمة الرئيسية)"))
                 return
             name_part, parent_part = text.split("|",1)
             name = name_part.strip()
@@ -216,17 +274,17 @@ async def process_text_message(msg: dict):
                 parent_id = int(parent_part.strip())
             except Exception:
                 if bot and chat_id:
-                    await bot.send_message(chat_id=chat_id, text="رقم الأب يجب أن يكون عدداً صحيحاً.")
+                    await safe_telegram_call(bot.send_message(chat_id=chat_id, text="رقم الأب يجب أن يكون عدداً صحيحاً."))
                 return
             callback_data = f"btn_{int(time.time())}_{name.replace(' ','_')}"
             try:
                 await db_execute("INSERT INTO buttons (name, callback_data, parent_id) VALUES ($1,$2,$3)", name, callback_data, parent_id)
                 if bot and chat_id:
-                    await bot.send_message(chat_id=chat_id, text=f"تم إضافة الزر '{name}' بنجاح! (الرمز: {callback_data})")
+                    await safe_telegram_call(bot.send_message(chat_id=chat_id, text=f"تم إضافة الزر '{name}' بنجاح! (الرمز: {callback_data})"))
             except Exception:
                 logger.exception("Failed to add button")
                 if bot and chat_id:
-                    await bot.send_message(chat_id=chat_id, text="حصل خطأ أثناء إضافة الزر.")
+                    await safe_telegram_call(bot.send_message(chat_id=chat_id, text="حصل خطأ أثناء إضافة الزر."))
             admin_state.pop(user_id, None)
             return
 
@@ -234,22 +292,22 @@ async def process_text_message(msg: dict):
         if action == "awaiting_remove":
             if not text:
                 if bot and chat_id:
-                    await bot.send_message(chat_id=chat_id, text="أرسل رقم الزر المراد حذفه.")
+                    await safe_telegram_call(bot.send_message(chat_id=chat_id, text="أرسل رقم الزر المراد حذفه."))
                 return
             try:
                 bid = int(text.strip())
             except Exception:
                 if bot and chat_id:
-                    await bot.send_message(chat_id=chat_id, text="يرجى إرسال رقم صحيح.")
+                    await safe_telegram_call(bot.send_message(chat_id=chat_id, text="يرجى إرسال رقم صحيح."))
                 return
             try:
                 await db_execute("DELETE FROM buttons WHERE id = $1", bid)
                 if bot and chat_id:
-                    await bot.send_message(chat_id=chat_id, text=f"تم حذف الزر بالمعرف {bid}.")
+                    await safe_telegram_call(bot.send_message(chat_id=chat_id, text=f"تم حذف الزر بالمعرف {bid}."))
             except Exception:
                 logger.exception("Failed to delete button")
                 if bot and chat_id:
-                    await bot.send_message(chat_id=chat_id, text="حصل خطأ أثناء حذف الزر.")
+                    await safe_telegram_call(bot.send_message(chat_id=chat_id, text="حصل خطأ أثناء حذف الزر."))
             admin_state.pop(user_id, None)
             return
 
@@ -257,17 +315,17 @@ async def process_text_message(msg: dict):
         if action == "awaiting_upload_button_id":
             if not text:
                 if bot and chat_id:
-                    await bot.send_message(chat_id=chat_id, text="أرسل رقم الزر الذي تريد رفع الملف له.")
+                    await safe_telegram_call(bot.send_message(chat_id=chat_id, text="أرسل رقم الزر الذي تريد رفع الملف له."))
                 return
             try:
                 bid = int(text.strip())
             except Exception:
                 if bot and chat_id:
-                    await bot.send_message(chat_id=chat_id, text="يرجى إرسال رقم صحيح.")
+                    await safe_telegram_call(bot.send_message(chat_id=chat_id, text="يرجى إرسال رقم صحيح."))
                 return
             admin_state[user_id] = {"action": "awaiting_upload_file", "target_button_id": bid}
             if bot and chat_id:
-                await bot.send_message(chat_id=chat_id, text="الآن أرسل الملف (مستند/صورة/فيديو) أو نص لربطه بالزر.")
+                await safe_telegram_call(bot.send_message(chat_id=chat_id, text="الآن أرسل الملف (مستند/صورة/فيديو) أو نص لربطه بالزر."))
             return
 
         # awaiting upload file
@@ -275,7 +333,7 @@ async def process_text_message(msg: dict):
             target_bid = state.get("target_button_id")
             if not target_bid:
                 if bot and chat_id:
-                    await bot.send_message(chat_id=chat_id, text="خطأ: لم يتم تحديد الزر الهدف.")
+                    await safe_telegram_call(bot.send_message(chat_id=chat_id, text="خطأ: لم يتم تحديد الزر الهدف."))
                 admin_state.pop(user_id, None)
                 return
             file_id = None; content_type = None
@@ -289,16 +347,16 @@ async def process_text_message(msg: dict):
                 file_id = text.strip(); content_type = "text"
             if not file_id:
                 if bot and chat_id:
-                    await bot.send_message(chat_id=chat_id, text="لم يتم العثور على ملف في هذه الرسالة. أرسل ملفاً أو نصاً.")
+                    await safe_telegram_call(bot.send_message(chat_id=chat_id, text="لم يتم العثور على ملف في هذه الرسالة. أرسل ملفاً أو نصاً."))
                 return
             try:
                 await db_execute("UPDATE buttons SET content_type=$1, file_id=$2 WHERE id=$3", content_type, file_id, target_bid)
                 if bot and chat_id:
-                    await bot.send_message(chat_id=chat_id, text="تم ربط الملف بالزر بنجاح!")
+                    await safe_telegram_call(bot.send_message(chat_id=chat_id, text="تم ربط الملف بالزر بنجاح!"))
             except Exception:
                 logger.exception("Failed to update button with file")
                 if bot and chat_id:
-                    await bot.send_message(chat_id=chat_id, text="حصل خطأ أثناء ربط الملف.")
+                    await safe_telegram_call(bot.send_message(chat_id=chat_id, text="حصل خطأ أثناء ربط الملف."))
             admin_state.pop(user_id, None)
             return
 
@@ -323,7 +381,7 @@ async def process_text_message(msg: dict):
             lines.append("\nبعد الانضمام اضغط: 'لقد انضممت — تحقق'")
             try:
                 if bot and chat_id:
-                    await bot.send_message(chat_id=chat_id, text="\n".join(lines), reply_markup=missing_chats_markup())
+                    await safe_telegram_call(bot.send_message(chat_id=chat_id, text="\n".join(lines), reply_markup=missing_chats_markup()))
             except Exception:
                 logger.exception("Failed to send missing-chats message")
             return
@@ -338,9 +396,9 @@ async def process_text_message(msg: dict):
             markup = await build_main_menu()
             if bot and chat_id:
                 if markup:
-                    await bot.send_message(chat_id=chat_id, text="مرحباً! اختر القسم المناسب:", reply_markup=markup)
+                    await safe_telegram_call(bot.send_message(chat_id=chat_id, text="مرحباً! اختر القسم المناسب:", reply_markup=markup))
                 else:
-                    await bot.send_message(chat_id=chat_id, text="مرحباً! لا توجد أقسام متاحة حالياً.")
+                    await safe_telegram_call(bot.send_message(chat_id=chat_id, text="مرحباً! لا توجد أقسام متاحة حالياً."))
         except Exception:
             logger.exception("Failed to send /start reply")
         return
@@ -352,6 +410,7 @@ async def index():
 
 @app.post("/webhook")
 async def webhook(request: Request):
+    acquired = False
     # validate secret token header if set
     headers = {k.lower(): v for k, v in request.headers.items()}
     if WEBHOOK_SECRET_TOKEN:
@@ -366,10 +425,15 @@ async def webhook(request: Request):
         acquired = True
     except asyncio.TimeoutError:
         logger.warning("Server busy (concurrency max=%s). Rejecting incoming webhook briefly.", MAX_CONCURRENT)
-        # Respond 200 to avoid Telegram heavy retries; the client can try again.
-        return JSONResponse({"ok": False, "error": "server_busy"}, status_code=200)
+        # Use 429 for rate limiting instead of 200 to signal Telegram to slow down
+        return JSONResponse({"ok": False, "error": "server_busy"}, status_code=429)
 
     try:
+        # Log current load
+        current_count = MAX_CONCURRENT - PROCESSING_SEMAPHORE._value
+        if current_count > MAX_CONCURRENT * 0.8:  # 80% capacity
+            logger.warning("High concurrency: %s/%s requests in progress", current_count, MAX_CONCURRENT)
+
         try:
             update = await request.json()
         except Exception:
@@ -419,7 +483,7 @@ async def webhook(request: Request):
             # quick answerCallbackQuery
             try:
                 if bot and cq_id:
-                    await bot.answer_callback_query(callback_query_id=cq_id)
+                    await safe_telegram_call(bot.answer_callback_query(callback_query_id=cq_id))
             except Exception:
                 logger.exception("answer_callback_query failed")
 
@@ -430,9 +494,9 @@ async def webhook(request: Request):
                     try:
                         mk = await build_main_menu()
                         if bot and chat_id and message_id:
-                            await bot.edit_message_text(chat_id=chat_id, message_id=message_id, text="شكرًا! تم التحقق — يمكنك الآن استخدام البوت:", reply_markup=mk)
+                            await safe_telegram_call(bot.edit_message_text(chat_id=chat_id, message_id=message_id, text="شكرًا! تم التحقق — يمكنك الآن استخدام البوت:", reply_markup=mk))
                         elif bot and chat_id:
-                            await bot.send_message(chat_id=chat_id, text="شكرًا! تم التحقق — يمكنك الآن استخدام البوت:", reply_markup=mk)
+                            await safe_telegram_call(bot.send_message(chat_id=chat_id, text="شكرًا! تم التحقق — يمكنك الآن استخدام البوت:", reply_markup=mk))
                     except Exception:
                         logger.exception("Failed to show main menu after membership check")
                 else:
@@ -452,9 +516,9 @@ async def webhook(request: Request):
                     lines.append("\nبعد التصحيح اضغط: 'لقد انضممت — تحقق'")
                     try:
                         if bot and chat_id and message_id:
-                            await bot.edit_message_text(chat_id=chat_id, message_id=message_id, text="\n".join(lines), reply_markup=missing_chats_markup())
+                            await safe_telegram_call(bot.edit_message_text(chat_id=chat_id, message_id=message_id, text="\n".join(lines), reply_markup=missing_chats_markup()))
                         elif bot and chat_id:
-                            await bot.send_message(chat_id=chat_id, text="\n".join(lines), reply_markup=missing_chats_markup())
+                            await safe_telegram_call(bot.send_message(chat_id=chat_id, text="\n".join(lines), reply_markup=missing_chats_markup()))
                     except Exception:
                         logger.exception("Failed to send missing-chats message")
                 return JSONResponse({"ok": True})
@@ -464,15 +528,15 @@ async def webhook(request: Request):
                 if user_id not in ADMIN_IDS:
                     try:
                         if bot and cq_id:
-                            await bot.answer_callback_query(callback_query_id=cq_id, text="ليس لديك صلاحية للوصول إلى هذه الصفحة.")
+                            await safe_telegram_call(bot.answer_callback_query(callback_query_id=cq_id, text="ليس لديك صلاحية للوصول إلى هذه الصفحة."))
                     except Exception:
                         logger.exception("answer_callback_query failed for unauthorized admin_panel")
                     return JSONResponse({"ok": True})
                 try:
                     if bot and chat_id and message_id:
-                        await bot.edit_message_text(chat_id=chat_id, message_id=message_id, text="لوحة تحكم المشرف:", reply_markup=admin_panel_markup())
+                        await safe_telegram_call(bot.edit_message_text(chat_id=chat_id, message_id=message_id, text="لوحة تحكم المشرف:", reply_markup=admin_panel_markup()))
                     elif bot and chat_id:
-                        await bot.send_message(chat_id=chat_id, text="لوحة تحكم المشرف:", reply_markup=admin_panel_markup())
+                        await safe_telegram_call(bot.send_message(chat_id=chat_id, text="لوحة تحكم المشرف:", reply_markup=admin_panel_markup()))
                 except Exception:
                     logger.exception("Failed to show admin panel")
                 return JSONResponse({"ok": True})
@@ -483,7 +547,7 @@ async def webhook(request: Request):
                     admin_state[user_id] = {"action": "awaiting_add"}
                     try:
                         if bot and chat_id:
-                            await bot.send_message(chat_id=chat_id, text="أرسل اسم الزر الجديد ورقم الزر الأب بالصيغة:\nاسم الزر|رقم الأب (0 للقائمة الرئيسية)")
+                            await safe_telegram_call(bot.send_message(chat_id=chat_id, text="أرسل اسم الزر الجديد ورقم الزر الأب بالصيغة:\nاسم الزر|رقم الأب (0 للقائمة الرئيسية)"))
                     except Exception:
                         logger.exception("Failed to send admin add instruction")
                 return JSONResponse({"ok": True})
@@ -493,7 +557,7 @@ async def webhook(request: Request):
                     admin_state[user_id] = {"action": "awaiting_remove"}
                     try:
                         if bot and chat_id:
-                            await bot.send_message(chat_id=chat_id, text="أرسل رقم الزر الذي تريد حذفه (انظر 'عرض جميع الأزرار').")
+                            await safe_telegram_call(bot.send_message(chat_id=chat_id, text="أرسل رقم الزر الذي تريد حذفه (انظر 'عرض جميع الأزرار')."))
                     except Exception:
                         logger.exception("Failed to send admin remove instruction")
                 return JSONResponse({"ok": True})
@@ -503,7 +567,7 @@ async def webhook(request: Request):
                     admin_state[user_id] = {"action": "awaiting_upload_button_id"}
                     try:
                         if bot and chat_id:
-                            await bot.send_message(chat_id=chat_id, text="أرسل رقم الزر الذي تريد رفع الملف له ثم أرسل الملف بعد ذلك.")
+                            await safe_telegram_call(bot.send_message(chat_id=chat_id, text="أرسل رقم الزر الذي تريد رفع الملف له ثم أرسل الملف بعد ذلك."))
                     except Exception:
                         logger.exception("Failed to send admin upload instruction")
                 return JSONResponse({"ok": True})
@@ -516,20 +580,20 @@ async def webhook(request: Request):
                         for r in rows:
                             lines.append(f"{r['id']}: {r['name']} (رمز: {r['callback_data']}, أب: {r['parent_id']})")
                         if bot and chat_id:
-                            await bot.send_message(chat_id=chat_id, text="\n".join(lines))
+                            await safe_telegram_call(bot.send_message(chat_id=chat_id, text="\n".join(lines)))
                     except Exception:
                         logger.exception("admin_list_buttons failed")
                         if bot and chat_id:
-                            await bot.send_message(chat_id=chat_id, text="حصل خطأ أثناء جلب الأزرار.")
+                            await safe_telegram_call(bot.send_message(chat_id=chat_id, text="حصل خطأ أثناء جلب الأزرار."))
                 return JSONResponse({"ok": True})
 
             if data == "back_to_main":
                 try:
                     mk = await build_main_menu()
                     if bot and chat_id and message_id:
-                        await bot.edit_message_text(chat_id=chat_id, message_id=message_id, text="مرحباً! اختر القسم المناسب:", reply_markup=mk)
+                        await safe_telegram_call(bot.edit_message_text(chat_id=chat_id, message_id=message_id, text="مرحباً! اختر القسم المناسب:", reply_markup=mk))
                     elif bot and chat_id:
-                        await bot.send_message(chat_id=chat_id, text="مرحباً! اختر القسم المناسب:", reply_markup=mk)
+                        await safe_telegram_call(bot.send_message(chat_id=chat_id, text="مرحباً! اختر القسم المناسب:", reply_markup=mk))
                 except Exception:
                     logger.exception("back_to_main failed")
                 return JSONResponse({"ok": True})
@@ -545,13 +609,13 @@ async def webhook(request: Request):
                 try:
                     ctype = row["content_type"]; fid = row["file_id"]
                     if ctype == "document":
-                        await bot.send_document(chat_id=chat_id, document=fid)
+                        await safe_telegram_call(bot.send_document(chat_id=chat_id, document=fid))
                     elif ctype == "photo":
-                        await bot.send_photo(chat_id=chat_id, photo=fid)
+                        await safe_telegram_call(bot.send_photo(chat_id=chat_id, photo=fid))
                     elif ctype == "video":
-                        await bot.send_video(chat_id=chat_id, video=fid)
+                        await safe_telegram_call(bot.send_video(chat_id=chat_id, video=fid))
                     else:
-                        await bot.send_message(chat_id=chat_id, text=str(fid))
+                        await safe_telegram_call(bot.send_message(chat_id=chat_id, text=str(fid)))
                 except Exception:
                     logger.exception("Failed to send button content")
                 return JSONResponse({"ok": True})
@@ -561,7 +625,7 @@ async def webhook(request: Request):
                 parent_row = await db_fetchone("SELECT id FROM buttons WHERE callback_data = $1", data)
                 if not parent_row:
                     if bot and chat_id:
-                        await bot.send_message(chat_id=chat_id, text="الزر غير موجود.")
+                        await safe_telegram_call(bot.send_message(chat_id=chat_id, text="الزر غير موجود."))
                     logger.info("Callback data not found: %s", data)
                     return JSONResponse({"ok": True})
                 parent_id = parent_row["id"]
@@ -571,12 +635,12 @@ async def webhook(request: Request):
                     keyboard.append([InlineKeyboardButton("العودة", callback_data="back_to_main")])
                     rm = InlineKeyboardMarkup(keyboard)
                     if bot and chat_id and message_id:
-                        await bot.edit_message_text(chat_id=chat_id, message_id=message_id, text="اختر من القائمة:", reply_markup=rm)
+                        await safe_telegram_call(bot.edit_message_text(chat_id=chat_id, message_id=message_id, text="اختر من القائمة:", reply_markup=rm))
                     elif bot and chat_id:
-                        await bot.send_message(chat_id=chat_id, text="اختر من القائمة:", reply_markup=rm)
+                        await safe_telegram_call(bot.send_message(chat_id=chat_id, text="اختر من القائمة:", reply_markup=rm))
                 else:
                     if bot and chat_id:
-                        await bot.send_message(chat_id=chat_id, text="هذه القائمة لا تحتوي على محتوى بعد.")
+                        await safe_telegram_call(bot.send_message(chat_id=chat_id, text="هذه القائمة لا تحتوي على محتوى بعد."))
             except Exception:
                 logger.exception("Failed to fetch/show submenu")
             return JSONResponse({"ok": True})
@@ -597,11 +661,16 @@ async def webhook(request: Request):
             return JSONResponse({"ok": True})
 
         return JSONResponse({"ok": True})
+        
+    except Exception as e:
+        logger.error("Unexpected error in webhook: %s", e)
+        return JSONResponse({"ok": False, "error": "internal_error"}, status_code=500)
     finally:
-        try:
-            PROCESSING_SEMAPHORE.release()
-        except Exception:
-            logger.exception("Failed to release processing semaphore")
+        if acquired:
+            try:
+                PROCESSING_SEMAPHORE.release()
+            except ValueError as e:
+                logger.warning("Semaphore release error (likely already released): %s", e)
 
 # ---------------- Startup / shutdown ----------------
 @app.on_event("startup")
@@ -621,7 +690,7 @@ async def on_startup():
         logger.exception("init_db_schema_and_defaults failed")
     try:
         bot = Bot(token=BOT_TOKEN)
-        me = await bot.get_me()
+        me = await safe_telegram_call(bot.get_me())
         BOT_ID = getattr(me, "id", None)
         logger.info("Bot ready id=%s username=%s", BOT_ID, getattr(me,"username",None))
     except Exception:
@@ -633,9 +702,9 @@ async def on_startup():
         webhook_target = WEBHOOK_URL.rstrip("/") + "/webhook"
         try:
             if WEBHOOK_SECRET_TOKEN:
-                await bot.set_webhook(url=webhook_target, secret_token=WEBHOOK_SECRET_TOKEN)
+                await safe_telegram_call(bot.set_webhook(url=webhook_target, secret_token=WEBHOOK_SECRET_TOKEN))
             else:
-                await bot.set_webhook(url=webhook_target)
+                await safe_telegram_call(bot.set_webhook(url=webhook_target))
             logger.info("Webhook set -> %s", webhook_target)
         except Exception:
             logger.exception("Failed to set webhook")
@@ -646,7 +715,7 @@ async def on_shutdown():
     logger.info("Shutdown: cleaning up")
     try:
         if bot and WEBHOOK_URL:
-            await bot.delete_webhook()
+            await safe_telegram_call(bot.delete_webhook())
     except Exception:
         logger.exception("Failed to delete webhook")
     if pg_pool:
