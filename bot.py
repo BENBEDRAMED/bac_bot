@@ -9,7 +9,7 @@ import psycopg2
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse, PlainTextResponse
 import uvicorn
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Bot
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Bot, User
 
 # ------------------ Logging ------------------
 logging.basicConfig(
@@ -25,12 +25,13 @@ WEBHOOK_URL: Optional[str] = os.environ.get("WEBHOOK_URL")  # e.g. "https://your
 DATABASE_URL: Optional[str] = os.environ.get("DATABASE_URL")
 try:
     ADMIN_IDS = [int(id.strip()) for id in os.environ.get("ADMIN_IDS", "").split(",") if id.strip()]
-except ValueError:
+except Exception:
     ADMIN_IDS = []
 
 # ------------------ Globals ------------------
 app = FastAPI()
 bot: Optional[Bot] = None  # will be created on startup
+BOT_ID: Optional[int] = None  # numeric id of the bot user (filled on startup)
 
 # ------------------ DB helpers ------------------
 def get_db_connection(max_retries: int = 3, retry_delay: int = 5):
@@ -158,19 +159,44 @@ async def webhook(request: Request):
         logger.error("Failed to parse JSON from webhook: %s", e)
         raise HTTPException(status_code=400, detail="Invalid JSON")
 
-    logger.info("Incoming webhook update: %s", data)
+    logger.info("Incoming webhook update id=%s type keys=%s", data.get("update_id"), list(data.keys()))
 
-    # If message with text and it starts with /start -> handle
-    if "message" in data:
+    # Protect: ignore updates that are from bots (including this bot) to avoid loops
+    # For message updates:
+    if "message" in data and isinstance(data["message"], dict):
+        msg = data["message"]
+        from_user = msg.get("from", {})
+
+        # If there is no from_user information, just acknowledge
+        if not isinstance(from_user, dict):
+            return JSONResponse({"ok": True})
+
+        # Ignore messages coming from any bot account
+        if from_user.get("is_bot"):
+            logger.debug("Ignoring update from a bot account (is_bot=True).")
+            return JSONResponse({"ok": True})
+
+        # Also ignore messages coming from this bot's own user id (double safety)
+        if BOT_ID is not None and from_user.get("id") == BOT_ID:
+            logger.debug("Ignoring update from this bot's own id.")
+            return JSONResponse({"ok": True})
+
+    # Handle /start messages only (from humans)
+    if "message" in data and isinstance(data["message"], dict):
         msg = data["message"]
         text = msg.get("text", "")
         chat = msg.get("chat", {})
         from_user = msg.get("from", {})
 
         if isinstance(text, str) and text.strip().lower().startswith("/start"):
+            # Defensive extraction
             chat_id = chat.get("id")
             user_id = from_user.get("id")
             first_name = from_user.get("first_name", "")
+
+            if chat_id is None or user_id is None:
+                logger.warning("Missing chat_id or user_id in /start update; ignoring.")
+                return JSONResponse({"ok": True})
 
             # Save user to DB
             conn = get_db_connection()
@@ -207,7 +233,7 @@ async def webhook(request: Request):
                 keyboard = [[InlineKeyboardButton(name, callback_data=callback_data)] for name, callback_data in buttons]
                 reply_markup = InlineKeyboardMarkup(keyboard)
 
-            # Send reply message
+            # Send reply message (async)
             try:
                 if not bot:
                     logger.error("Bot not initialized; cannot send message.")
@@ -222,14 +248,14 @@ async def webhook(request: Request):
 
             return JSONResponse({"ok": True})
 
-    # For other updates, just acknowledge
+    # Acknowledge all other update types (no-op)
     return JSONResponse({"ok": True})
 
 
 # ------------------ Startup / Shutdown ------------------
 @app.on_event("startup")
 async def on_startup():
-    global bot
+    global bot, BOT_ID
     logger.info("Starting application startup...")
 
     # Basic env validation
@@ -245,11 +271,22 @@ async def on_startup():
         logger.exception("init_db() failed: %s", e)
 
     # Initialize Bot instance
-    bot = Bot(token=BOT_TOKEN)
-    logger.info("Telegram Bot instance created")
+    try:
+        bot = Bot(token=BOT_TOKEN)
+        # fetch bot info to get BOT_ID (async)
+        me = await bot.get_me()
+        if isinstance(me, User):
+            BOT_ID = me.id
+        else:
+            BOT_ID = getattr(me, "id", None)
+        logger.info("Telegram Bot instance created (id=%s, username=%s)", BOT_ID, getattr(me, "username", None))
+    except Exception as e:
+        logger.exception("Failed to create Bot or fetch bot info: %s", e)
+        bot = None
+        BOT_ID = None
 
     # If WEBHOOK_URL is provided, register webhook with Telegram
-    if WEBHOOK_URL:
+    if WEBHOOK_URL and bot:
         webhook_target = WEBHOOK_URL.rstrip("/") + "/webhook"
         try:
             if WEBHOOK_SECRET_TOKEN:
@@ -260,7 +297,10 @@ async def on_startup():
         except Exception as e:
             logger.exception("Failed to set webhook to %s : %s", webhook_target, e)
     else:
-        logger.warning("WEBHOOK_URL not set — incoming Telegram requests will not reach this server unless webhook is set manually.")
+        if not WEBHOOK_URL:
+            logger.warning("WEBHOOK_URL not set — incoming Telegram requests will not reach this server unless webhook is set manually.")
+        else:
+            logger.warning("Bot not initialized; skipping webhook registration.")
 
 
 @app.on_event("shutdown")
@@ -280,6 +320,7 @@ async def on_shutdown():
 def main():
     port = int(os.environ.get("PORT", 10000))
     logger.info("Starting uvicorn on 0.0.0.0:%s", port)
+    # uvicorn.run is blocking and will serve the FastAPI app
     uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")
 
 
