@@ -1,11 +1,12 @@
 import logging
 import os
 import psycopg2
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, ContextTypes, CallbackQueryHandler, MessageHandler, filters
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Bot
 from urllib.parse import urlparse
-import json
 import time
+from fastapi import FastAPI, Request, HTTPException
+from fastapi.responses import JSONResponse
+import uvicorn
 
 # Configure logging
 logging.basicConfig(
@@ -24,7 +25,7 @@ except ValueError as e:
     logger.error(f"Error parsing ADMIN_IDS: {e}")
     ADMIN_IDS = []
 
-# Database connection with retry
+# DB helpers (unchanged logic)
 def get_db_connection(max_retries=3, retry_delay=5):
     for attempt in range(max_retries):
         try:
@@ -51,7 +52,6 @@ def get_db_connection(max_retries=3, retry_delay=5):
                 time.sleep(retry_delay)
     return None
 
-# Initialize database
 def init_db():
     conn = get_db_connection()
     if conn is None:
@@ -60,7 +60,6 @@ def init_db():
 
     cursor = conn.cursor()
 
-    # Create buttons table
     cursor.execute('''
     CREATE TABLE IF NOT EXISTS buttons (
         id SERIAL PRIMARY KEY,
@@ -73,7 +72,6 @@ def init_db():
     )
     ''')
 
-    # Create users table
     cursor.execute('''
     CREATE TABLE IF NOT EXISTS users (
         user_id BIGINT PRIMARY KEY,
@@ -84,7 +82,6 @@ def init_db():
     )
     ''')
 
-    # Insert default buttons
     default_buttons = [
         ('العلمي', 'science', 0, None, None),
         ('الأدبي', 'literary', 0, None, None),
@@ -101,317 +98,123 @@ def init_db():
     conn.close()
     logger.info("Database initialized successfully")
 
-# Check if user is admin
 def is_admin(user_id):
     return user_id in ADMIN_IDS
 
-# Start command
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    first_name = update.effective_user.first_name
+# --- Minimal FastAPI webhook app that handles /start messages ---
 
-    # Save user to database
-    conn = get_db_connection()
-    if conn is None:
-        await update.message.reply_text("عذراً، هناك مشكلة تقنية. يرجى المحاولة لاحقاً.")
-        return
+app = FastAPI()
+bot = None  # will be set in main()
 
-    cursor = conn.cursor()
-    cursor.execute('INSERT INTO users (user_id, first_name) VALUES (%s, %s) ON CONFLICT (user_id) DO NOTHING', (user_id, first_name))
-    conn.commit()
-    conn.close()
+@app.post("/webhook")
+async def webhook(request: Request):
+    """
+    Minimal webhook handler. Validates secret token header (if provided),
+    then looks for message updates with text '/start' and responds by saving
+    the user and sending the main menu. Returns 200 JSON for Telegram.
+    """
+    # Validate secret token header if configured
+    if WEBHOOK_SECRET_TOKEN:
+        header = request.headers.get("X-Telegram-Bot-Api-Secret-Token")
+        if header != WEBHOOK_SECRET_TOKEN:
+            logger.warning("Invalid secret token in incoming webhook request.")
+            # Telegram will consider the request failed; return 403 to be explicit
+            raise HTTPException(status_code=403, detail="Invalid secret token")
 
-    # Show main menu
-    await show_main_menu(update, context)
+    try:
+        data = await request.json()
+    except Exception as e:
+        logger.error("Failed to parse JSON from webhook request: %s", e)
+        raise HTTPException(status_code=400, detail="Invalid JSON")
 
-# Show main menu
-async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    conn = get_db_connection()
-    if conn is None:
-        if update.callback_query:
-            await update.callback_query.edit_message_text("عذراً، هناك مشكلة تقنية. يرجى المحاولة لاحقاً.")
-        else:
-            await update.message.reply_text("عذراً، هناك مشكلة تقنية. يرجى المحاولة لاحقاً.")
-        return
+    logger.info("Incoming webhook update: %s", data)
 
-    cursor = conn.cursor()
-    cursor.execute('SELECT name, callback_data FROM buttons WHERE parent_id = 0')
-    buttons = cursor.fetchall()
-    conn.close()
+    # Simple handling of message /start
+    if "message" in data:
+        msg = data["message"]
+        text = msg.get("text", "")
+        chat = msg.get("chat", {})
+        from_user = msg.get("from", {})
 
-    if not buttons:
-        if update.callback_query:
-            await update.callback_query.edit_message_text("لا توجد أقسام متاحة حالياً.")
-        else:
-            await update.message.reply_text("لا توجد أقسام متاحة حالياً.")
-        return
+        # Only handle /start here (case-insensitive)
+        if isinstance(text, str) and text.strip().lower().startswith("/start"):
+            chat_id = chat.get("id")
+            user_id = from_user.get("id")
+            first_name = from_user.get("first_name", "")
 
-    keyboard = [[InlineKeyboardButton(name, callback_data=callback_data)] for name, callback_data in buttons]
-    reply_markup = InlineKeyboardMarkup(keyboard)
+            # Save user to DB (mirrors your original start handler)
+            conn = get_db_connection()
+            if conn is None:
+                # Return 200 to Telegram (so it won't keep retrying) but log the issue
+                logger.error("DB connection failed while handling /start")
+                # You may choose to return 500 so Telegram retries; for now we return 200 to avoid too many retries
+                return JSONResponse({"ok": False, "error": "db"}, status_code=200)
 
-    if update.callback_query:
-        await update.callback_query.edit_message_text("اختر القسم المناسب:", reply_markup=reply_markup)
-    else:
-        await update.message.reply_text("مرحباً! اختر القسم المناسب:", reply_markup=reply_markup)
+            try:
+                cursor = conn.cursor()
+                cursor.execute(
+                    'INSERT INTO users (user_id, first_name) VALUES (%s, %s) ON CONFLICT (user_id) DO NOTHING',
+                    (user_id, first_name)
+                )
+                conn.commit()
 
-# Handle button clicks
-async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    callback_data = query.data
-    user_id = query.from_user.id
+                # Build main menu from buttons table (parent_id = 0)
+                cursor.execute('SELECT name, callback_data FROM buttons WHERE parent_id = 0')
+                buttons = cursor.fetchall()
+            except Exception as e:
+                logger.error("DB error while handling /start: %s", e)
+                buttons = []
+            finally:
+                conn.close()
 
-    conn = get_db_connection()
-    if conn is None:
-        await query.edit_message_text("عذراً، هناك مشكلة تقنية. يرجى المحاولة لاحقاً.")
-        return
-
-    cursor = conn.cursor()
-
-    if callback_data == 'admin_panel':
-        if is_admin(user_id):
-            await show_admin_panel(update, context)
-        else:
-            await query.edit_message_text("ليس لديك صلاحية للوصول إلى هذه الصفحة.")
-        conn.close()
-        return
-
-    # Check if button has content
-    cursor.execute('SELECT content_type, file_id FROM buttons WHERE callback_data = %s', (callback_data,))
-    button_data = cursor.fetchone()
-
-    if button_data and button_data[0] and button_data[1]:
-        # Send content if button has associated file
-        content_type, file_id = button_data
-        try:
-            chat_id = query.message.chat_id if hasattr(query.message, "chat_id") else query.message.chat.id
-            if content_type == 'document':
-                await context.bot.send_document(chat_id=chat_id, document=file_id)
-            elif content_type == 'photo':
-                await context.bot.send_photo(chat_id=chat_id, photo=file_id)
-            elif content_type == 'video':
-                await context.bot.send_video(chat_id=chat_id, video=file_id)
-            elif content_type == 'text':
-                await query.edit_message_text(file_id)
-        except Exception as e:
-            logger.error(f"Error sending content: {e}")
-            await query.edit_message_text("خطأ أثناء إرسال المحتوى. يرجى المحاولة لاحقاً.")
-    else:
-        # Show submenu if button is a parent
-        cursor.execute('SELECT id FROM buttons WHERE callback_data = %s', (callback_data,))
-        button_row = cursor.fetchone()
-        if button_row:
-            button_id = button_row[0]
-            cursor.execute('SELECT name, callback_data FROM buttons WHERE parent_id = %s', (button_id,))
-            sub_buttons = cursor.fetchall()
-
-            if sub_buttons:
-                keyboard = [[InlineKeyboardButton(name, callback_data=callback_data)] for name, callback_data in sub_buttons]
-                keyboard.append([InlineKeyboardButton("العودة", callback_data="back_to_main")])
+            # Build keyboard
+            if buttons:
+                keyboard = [[InlineKeyboardButton(name, callback_data=callback_data)] for name, callback_data in buttons]
                 reply_markup = InlineKeyboardMarkup(keyboard)
-                await query.edit_message_text("اختر من القائمة:", reply_markup=reply_markup)
             else:
-                await query.edit_message_text("هذه القائمة لا تحتوي على محتوى بعد.")
-        else:
-            await query.edit_message_text("الزر غير موجود.")
+                reply_markup = None
 
-    conn.close()
+            try:
+                # Send welcome message + menu
+                text_msg = "مرحباً! اختر القسم المناسب:"
+                if reply_markup:
+                    await bot.send_message(chat_id=chat_id, text=text_msg, reply_markup=reply_markup)
+                else:
+                    await bot.send_message(chat_id=chat_id, text="مرحباً! لا توجد أقسام متاحة حالياً.")
+            except Exception as e:
+                logger.error("Error sending /start response: %s", e)
 
-# Show admin panel
-async def show_admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    keyboard = [
-        [InlineKeyboardButton("إضافة زر جديد", callback_data="admin_add_button")],
-        [InlineKeyboardButton("رفع ملف لزر موجود", callback_data="admin_upload_to_button")],
-        [InlineKeyboardButton("عرض جميع الأزرار", callback_data="admin_list_buttons")],
-        [InlineKeyboardButton("العودة للقائمة الرئيسية", callback_data="back_to_main")]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
+            # Return OK to Telegram
+            return JSONResponse({"ok": True})
 
-    if update.callback_query:
-        await update.callback_query.edit_message_text("لوحة تحكم المشرف:", reply_markup=reply_markup)
-    else:
-        await update.message.reply_text("لوحة تحكم المشرف:", reply_markup=reply_markup)
+    # For any other update type we just acknowledge with 200 (no-op)
+    return JSONResponse({"ok": True})
 
-# Handle admin commands
-async def handle_admin_commands(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    callback_data = query.data
-
-    if callback_data == "admin_add_button":
-        await query.edit_message_text("أرسل اسم الزر الجديد ورقم الزر الأب بالصيغة: اسم الزر|رقم الأب (0 للقائمة الرئيسية)")
-        context.user_data['awaiting_button_data'] = True
-
-    elif callback_data == "admin_upload_to_button":
-        conn = get_db_connection()
-        if conn is None:
-            await query.edit_message_text("عذراً، هناك مشكلة تقنية. يرجى المحاولة لاحقاً.")
-            return
-
-        cursor = conn.cursor()
-        cursor.execute('SELECT id, name FROM buttons')
-        buttons = cursor.fetchall()
-        conn.close()
-
-        if not buttons:
-            await query.edit_message_text("لا توجد أزرار متاحة للربط.")
-            return
-
-        buttons_list = "\n".join([f"{id}: {name}" for id, name in buttons])
-        await query.edit_message_text(f"أرسل رقم الزر ثم الملف بالصيغة: رقم الزر\nثم أرسل الملف بعد هذه الرسالة\n\nالأزرار المتاحة:\n{buttons_list}")
-        context.user_data['awaiting_upload'] = True
-
-    elif callback_data == "admin_list_buttons":
-        conn = get_db_connection()
-        if conn is None:
-            await query.edit_message_text("عذراً، هناك مشكلة تقنية. يرجى المحاولة لاحقاً.")
-            return
-
-        cursor = conn.cursor()
-        cursor.execute('SELECT id, name, callback_data, parent_id FROM buttons')
-        buttons = cursor.fetchall()
-        conn.close()
-
-        if not buttons:
-            await query.edit_message_text("لا توجد أزرار في قاعدة البيانات.")
-            return
-
-        buttons_list = "\n".join([f"{id}: {name} (الرمز: {callback_data}, الأب: {parent_id})" for id, name, callback_data, parent_id in buttons])
-        await query.edit_message_text(f"جميع الأزرار:\n{buttons_list}")
-
-# Handle admin text messages
-async def handle_admin_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if not is_admin(user_id):
-        return
-
-    message_text = update.message.text
-
-    if 'awaiting_button_data' in context.user_data:
-        try:
-            name, parent_id = message_text.split('|')
-            parent_id = int(parent_id)
-
-            # Generate unique callback data
-            callback_data = f"btn_{name.replace(' ', '_').lower()}_{int(time.time())}"
-
-            conn = get_db_connection()
-            if conn is None:
-                await update.message.reply_text("عذراً، هناك مشكلة تقنية. يرجى المحاولة لاحقاً.")
-                return
-
-            cursor = conn.cursor()
-            cursor.execute('INSERT INTO buttons (name, callback_data, parent_id) VALUES (%s, %s, %s)',
-                          (name, callback_data, parent_id))
-            conn.commit()
-            conn.close()
-
-            await update.message.reply_text(f"تم إضافة الزر '{name}' بنجاح!")
-            del context.user_data['awaiting_button_data']
-
-        except Exception as e:
-            logger.error(f"Error adding button: {e}")
-            await update.message.reply_text(f"خطأ في الصيغة. يرجى استخدام: اسم الزر|رقم الأب")
-
-    elif 'awaiting_upload' in context.user_data:
-        try:
-            button_id = int(message_text)
-            context.user_data['target_button_id'] = button_id
-            await update.message.reply_text("الآن أرسل الملف الذي تريد رفعه")
-        except ValueError:
-            await update.message.reply_text("رقم الزر غير صحيح")
-
-# Handle admin file uploads
-async def handle_admin_files(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if not is_admin(user_id):
-        return
-
-    if 'target_button_id' in context.user_data:
-        button_id = context.user_data['target_button_id']
-        file_id = None
-        content_type = None
-
-        if update.message.document:
-            file_id = update.message.document.file_id
-            content_type = 'document'
-        elif update.message.photo:
-            file_id = update.message.photo[-1].file_id
-            content_type = 'photo'
-        elif update.message.video:
-            file_id = update.message.video.file_id
-            content_type = 'video'
-        elif update.message.text:
-            file_id = update.message.text
-            content_type = 'text'
-
-        if file_id:
-            conn = get_db_connection()
-            if conn is None:
-                await update.message.reply_text("عذراً، هناك مشكلة تقنية. يرجى المحاولة لاحقاً.")
-                return
-
-            cursor = conn.cursor()
-            cursor.execute('UPDATE buttons SET content_type = %s, file_id = %s WHERE id = %s',
-                          (content_type, file_id, button_id))
-            affected_rows = cursor.rowcount
-            conn.commit()
-            conn.close()
-
-            if affected_rows > 0:
-                await update.message.reply_text("تم ربط الملف بالزر بنجاح!")
-            else:
-                await update.message.reply_text("لم يتم العثور على الزر المحدد.")
-            del context.user_data['target_button_id']
-            del context.user_data['awaiting_upload']
-        else:
-            await update.message.reply_text("نوع الملف غير مدعوم")
-
-# Back to main menu
-async def back_to_main(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    await show_main_menu(update, context)
 
 # -------------------------
 # Synchronous entrypoint
 # -------------------------
 def main():
-    # Check required environment variables
-    if not all([BOT_TOKEN, DATABASE_URL, WEBHOOK_SECRET_TOKEN]):
-        logger.error("Missing required environment variables: BOT_TOKEN, DATABASE_URL, or WEBHOOK_SECRET_TOKEN")
+    global bot
+
+    # required env checks
+    if not all([BOT_TOKEN, DATABASE_URL]):
+        logger.error("Missing required environment variables: BOT_TOKEN or DATABASE_URL")
         return
 
-    # Initialize database
+    # Initialize DB (creates tables etc.)
     init_db()
 
-    # Set up bot
-    application = Application.builder().token(BOT_TOKEN).build()
+    # Initialize Bot instance (used in webhook)
+    bot = Bot(token=BOT_TOKEN)
 
-    # Add handlers
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CallbackQueryHandler(handle_button, pattern="^(?!admin_).*"))
-    application.add_handler(CallbackQueryHandler(handle_admin_commands, pattern="^admin_.*"))
-    application.add_handler(CallbackQueryHandler(back_to_main, pattern="^back_to_main$"))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_admin_messages))
-    application.add_handler(MessageHandler(filters.Document.ALL | filters.PHOTO | filters.VIDEO | filters.TEXT, handle_admin_files))
+    # Port for the ASGI server
+    port = int(os.environ.get("PORT", 10000))
 
-    # Set up webhook (run_webhook will handle webhook registration and run the loop)
-    webhook_url = os.environ.get('WEBHOOK_URL')
-    if not webhook_url:
-        logger.error("WEBHOOK_URL environment variable not set")
-        return
-
-    port = int(os.environ.get('PORT', 10000))
-
-    logger.info(f"Starting webhook listener at {webhook_url}/webhook on 0.0.0.0:{port}")
-    # run_webhook is a blocking call that initializes and starts the bot's loop
-    application.run_webhook(
-        listen="0.0.0.0",
-        port=port,
-        webhook_url=f"{webhook_url}/webhook",
-        secret_token=WEBHOOK_SECRET_TOKEN
-    )
+    # Log and start uvicorn (FastAPI) — Render will run this Python process and serve /webhook
+    logger.info("Starting FastAPI webhook listener on 0.0.0.0:%s", port)
+    # Note: host must be 0.0.0.0 for Render
+    uvicorn.run(app, host="0.0.0.0", port=port)
 
 if __name__ == "__main__":
     main()
