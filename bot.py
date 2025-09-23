@@ -218,7 +218,6 @@ def admin_panel_markup():
         [InlineKeyboardButton("إضافة زر جديد", callback_data="admin_add_button")],
         [InlineKeyboardButton("حذف زر", callback_data="admin_remove_button")],
         [InlineKeyboardButton("رفع ملف لزر موجود", callback_data="admin_upload_to_button")],
-        [InlineKeyboardButton("إزالة ملف من زر", callback_data="admin_remove_file")],  # NEW button
         [InlineKeyboardButton("عرض جميع الأزرار", callback_data="admin_list_buttons")],
         [InlineKeyboardButton("العودة", callback_data="back_to_main")],
     ]
@@ -297,82 +296,6 @@ async def process_text_message(msg: dict):
             except Exception:
                 if bot:
                     await safe_telegram_call(bot.send_message(chat_id, "خطأ في الحذف"))
-            return
-
-        # NEW: start remove-file confirmation flow when admin sent the button id
-        elif action == "admin_remove_file":
-            # Expect admin to send numeric button id
-            try:
-                bid = int(text.strip())
-            except ValueError:
-                if bot:
-                    await safe_telegram_call(bot.send_message(chat_id, "أرسل رقم معرف زر صحيح (رقم)."))
-                return
-
-            try:
-                row = await db_fetchone("SELECT id, name, content_type, file_id FROM buttons WHERE id = $1", bid)
-                if not row:
-                    if bot:
-                        await safe_telegram_call(bot.send_message(chat_id, f"لا يوجد زر بالمعرف {bid}"))
-                    admin_state.pop(user_id, None)
-                    return
-
-                # Ask for confirmation with inline buttons (Confirm / Cancel)
-                confirm_cb = f"confirm_remove_file:{bid}"
-                cancel_cb = f"cancel_remove_file:{bid}"
-                keyboard = [
-                    [
-                        InlineKeyboardButton("تأكيد الإزالة ❌", callback_data=confirm_cb),
-                        InlineKeyboardButton("إلغاء", callback_data=cancel_cb),
-                    ]
-                ]
-                markup = InlineKeyboardMarkup(keyboard)
-                info_text = f"هل أنت متأكد من إزالة الملف المرتبط بالزر '{row['name']}' (id={bid})؟\n"
-                info_text += f"المحتوى الحالي: {row['content_type'] or 'لا يوجد'}\n"
-                if bot:
-                    await safe_telegram_call(bot.send_message(chat_id, info_text, reply_markup=markup))
-
-                # Save pending confirmation state for this admin
-                admin_state[user_id] = {"action": "waiting_confirm_remove_file", "target_id": bid}
-            except Exception as e:
-                logger.error("Failed to prepare remove file confirmation: %s", e)
-                if bot:
-                    await safe_telegram_call(bot.send_message(chat_id, "حدث خطأ أثناء الإجراء"))
-                admin_state.pop(user_id, None)
-            return
-
-        elif action in ("awaiting_remove_file",):
-            # backward compatibility: respond similarly to awaiting_remove_file
-            try:
-                bid = int(text.strip())
-            except ValueError:
-                if bot:
-                    await safe_telegram_call(bot.send_message(chat_id, "أرسل رقم معرف زر صحيح (رقم)."))
-                return
-
-            try:
-                row = await db_fetchone("SELECT id, name FROM buttons WHERE id = $1", bid)
-                if not row:
-                    if bot:
-                        await safe_telegram_call(bot.send_message(chat_id, f"لا يوجد زر بالمعرف {bid}"))
-                    admin_state.pop(user_id, None)
-                    return
-
-                await db_execute(
-                    "UPDATE buttons SET content_type = NULL, file_id = NULL WHERE id = $1", bid
-                )
-
-                if bot:
-                    await safe_telegram_call(bot.send_message(
-                        chat_id,
-                        f"تمت إزالة الملف من الزر '{row['name']}' (id={bid})."
-                    ))
-                admin_state.pop(user_id, None)
-
-            except Exception as e:
-                logger.error("Failed to remove file: %s", e)
-                if bot:
-                    await safe_telegram_call(bot.send_message(chat_id, "حدث خطأ أثناء محاولة إزالة الملف"))
             return
 
     # Start command
@@ -464,12 +387,10 @@ async def webhook(request: Request):
                     await safe_telegram_call(bot.edit_message_text(
                         chat_id, message_id, "اختر القسم:", reply_markup=markup))
 
-            elif data in ["admin_add_button", "admin_remove_button", "admin_upload_to_button", "admin_remove_file"]:
-                # NOTE: admin_remove_file is included here to set the admin state and prompt for data
+            elif data in ["admin_add_button", "admin_remove_button", "admin_upload_to_button"]:
                 if user_id in ADMIN_IDS:
                     admin_state[user_id] = {"action": data}
                     if bot and chat_id:
-                        # Use a single prompt message for all these actions; process_text_message will handle specifics
                         await safe_telegram_call(bot.send_message(chat_id, "أرسل البيانات المطلوبة"))
 
             elif data == "admin_list_buttons" and user_id in ADMIN_IDS:
@@ -480,66 +401,6 @@ async def webhook(request: Request):
                         await safe_telegram_call(bot.send_message(chat_id, text or "لا توجد أزرار"))
                 except Exception as e:
                     logger.error("Failed to list buttons: %s", e)
-
-            # NEW: handle confirmation callbacks for removing file
-            elif data and data.startswith("confirm_remove_file:"):
-                try:
-                    bid_str = data.split(":", 1)[1]
-                    bid = int(bid_str)
-                except Exception:
-                    if bot and chat_id:
-                        await safe_telegram_call(bot.send_message(chat_id, "معلومات غير صحيحة."))
-                    return JSONResponse({"ok": True})
-
-                if user_id not in ADMIN_IDS:
-                    if bot and chat_id:
-                        await safe_telegram_call(bot.send_message(chat_id, "ليس لديك صلاحية للقيام بهذه العملية."))
-                    return JSONResponse({"ok": True})
-
-                state = admin_state.get(user_id)
-                if not state or state.get("action") != "waiting_confirm_remove_file" or state.get("target_id") != bid:
-                    if bot and chat_id:
-                        await safe_telegram_call(bot.send_message(chat_id, "لا توجد عملية معلقة أو أنها انتهت."))
-                    admin_state.pop(user_id, None)
-                    return JSONResponse({"ok": True})
-
-                try:
-                    row = await db_fetchone("SELECT id, name FROM buttons WHERE id = $1", bid)
-                    if not row:
-                        if bot and chat_id:
-                            await safe_telegram_call(bot.send_message(chat_id, f"لا يوجد زر بالمعرف {bid}"))
-                        admin_state.pop(user_id, None)
-                        return JSONResponse({"ok": True})
-
-                    await db_execute("UPDATE buttons SET content_type = NULL, file_id = NULL WHERE id = $1", bid)
-                    if bot and chat_id:
-                        await safe_telegram_call(bot.send_message(chat_id, f"تمت إزالة الملف من الزر '{row['name']}' (id={bid})."))
-                    admin_state.pop(user_id, None)
-                except Exception as e:
-                    logger.error("Failed to remove file on confirm: %s", e)
-                    if bot and chat_id:
-                        await safe_telegram_call(bot.send_message(chat_id, "حدث خطأ أثناء إزالة الملف"))
-                    admin_state.pop(user_id, None)
-
-            elif data and data.startswith("cancel_remove_file:"):
-                try:
-                    bid_str = data.split(":", 1)[1]
-                    bid = int(bid_str)
-                except Exception:
-                    if bot and chat_id:
-                        await safe_telegram_call(bot.send_message(chat_id, "معلومات غير صحيحة."))
-                    return JSONResponse({"ok": True})
-
-                if user_id not in ADMIN_IDS:
-                    if bot and chat_id:
-                        await safe_telegram_call(bot.send_message(chat_id, "ليس لديك صلاحية للقيام بهذه العملية."))
-                    return JSONResponse({"ok": True})
-
-                state = admin_state.get(user_id)
-                # Accept cancel even if state mismatches to make UX smoother
-                admin_state.pop(user_id, None)
-                if bot and chat_id:
-                    await safe_telegram_call(bot.send_message(chat_id, f"تم إلغاء عملية إزالة الملف للزر id={bid}."))
 
             else:
                 # Regular button handling
@@ -627,18 +488,12 @@ async def on_startup():
 @app.on_event("shutdown")
 async def on_shutdown():
     logger.info("Shutting down...")
-    if bot and WEBHOOK_URL:
-        try:
-            await safe_telegram_call(bot.delete_webhook())
-        except Exception:
-            pass
     if pg_pool:
         await pg_pool.close()
 
 # ---------------- Main ----------------
 def main():
     logger.info("Starting server on port %s", PORT)
-    # NOTE: removed unsupported kwargs (max_requests, max_requests_jitter) to be compatible with uvicorn.run()
     uvicorn.run(
         app, 
         host="0.0.0.0", 
@@ -646,6 +501,9 @@ def main():
         log_level="info",
         # Limit workers for stability
         workers=1,
+        # Limit request size
+        max_requests=1000,
+        max_requests_jitter=100
     )
 
 if __name__ == "__main__":
