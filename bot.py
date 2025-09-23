@@ -638,6 +638,7 @@ async def on_shutdown():
 # ---------------- Main ----------------
 def main():
     logger.info("Starting server on port %s", PORT)
+    # NOTE: removed unsupported kwargs (max_requests, max_requests_jitter) to be compatible with uvicorn.run()
     uvicorn.run(
         app, 
         host="0.0.0.0", 
@@ -645,9 +646,6 @@ def main():
         log_level="info",
         # Limit workers for stability
         workers=1,
-        # Limit request size
-        max_requests=1000,
-        max_requests_jitter=100
     )
 
 if __name__ == "__main__":
