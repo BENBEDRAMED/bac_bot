@@ -345,12 +345,12 @@ async def process_text_message(msg: dict):
                 await db_execute("INSERT INTO buttons (name, callback_data, parent_id) VALUES ($1,$2,$3)", 
                                name, callback_data, parent_id)
                 if bot:
-                    await safe_telegram_call(bot.send_message(chat_id, f"تم إضافة الزر '{name}'"))
+                    await safe_telegram_call(bot.send_message(chat_id=chat_id, text=f"تم إضافة الزر '{name}'"))
                 admin_state.pop(user_id, None)
             except Exception as e:
                 logger.error("Failed to add button: %s", e)
                 if bot:
-                    await safe_telegram_call(bot.send_message(chat_id, "خطأ في الإضافة"))
+                    await safe_telegram_call(bot.send_message(chat_id=chat_id, text="خطأ في الإضافة"))
             return
 
         elif action == "awaiting_remove":
@@ -358,11 +358,11 @@ async def process_text_message(msg: dict):
                 bid = int(text.strip())
                 await db_execute("DELETE FROM buttons WHERE id = $1", bid)
                 if bot:
-                    await safe_telegram_call(bot.send_message(chat_id, f"تم الحذف"))
+                    await safe_telegram_call(bot.send_message(chat_id=chat_id, text="تم الحذف"))
                 admin_state.pop(user_id, None)
             except Exception:
                 if bot:
-                    await safe_telegram_call(bot.send_message(chat_id, "خطأ في الحذف"))
+                    await safe_telegram_call(bot.send_message(chat_id=chat_id, text="خطأ في الحذف"))
             return
 
     # Start command
@@ -371,7 +371,11 @@ async def process_text_message(msg: dict):
         if not ok:
             message = "✋ يلزم الانضمام إلى:\n" + "\n".join(f"- {c}" for c in missing) + "\n\nاضغط 'لقد انضممت — تحقق'"
             if bot:
-                await safe_telegram_call(bot.send_message(chat_id, message, reply_markup=missing_chats_markup()))
+                await safe_telegram_call(bot.send_message(
+                    chat_id=chat_id, 
+                    text=message, 
+                    reply_markup=missing_chats_markup()
+                ))
             return
 
         # Save user and show menu
@@ -383,7 +387,11 @@ async def process_text_message(msg: dict):
 
         markup = await build_main_menu()
         if bot and markup:
-            await safe_telegram_call(bot.send_message(chat_id, "مرحباً! اختر القسم:", reply_markup=markup))
+            await safe_telegram_call(bot.send_message(
+                chat_id=chat_id, 
+                text="مرحباً! اختر القسم:", 
+                reply_markup=markup
+            ))
 
 # ---------------- Webhook handler ----------------
 @app.post("/webhook")
@@ -428,7 +436,7 @@ async def webhook(request: Request):
 
             # Answer callback first
             if bot and cq.get("id"):
-                await safe_telegram_call(bot.answer_callback_query(cq["id"]))
+                await safe_telegram_call(bot.answer_callback_query(callback_query_id=cq["id"]))
 
             # Handle different callback actions
             if data == "check_membership":
@@ -437,35 +445,57 @@ async def webhook(request: Request):
                     markup = await build_main_menu()
                     if bot and chat_id and message_id:
                         await safe_telegram_call(bot.edit_message_text(
-                            chat_id, message_id, "تم التحقق — اختر القسم:", reply_markup=markup))
+                            chat_id=chat_id,
+                            message_id=message_id,
+                            text="تم التحقق — اختر القسم:",
+                            reply_markup=markup
+                        ))
                 else:
                     if bot and chat_id and message_id:
                         await safe_telegram_call(bot.edit_message_text(
-                            chat_id, message_id, "لا زلت تحتاج للانضمام", reply_markup=missing_chats_markup()))
+                            chat_id=chat_id,
+                            message_id=message_id,
+                            text="لا زلت تحتاج للانضمام",
+                            reply_markup=missing_chats_markup()
+                        ))
 
             elif data == "admin_panel" and user_id in ADMIN_IDS:
                 if bot and chat_id and message_id:
                     await safe_telegram_call(bot.edit_message_text(
-                        chat_id, message_id, "لوحة التحكم:", reply_markup=admin_panel_markup()))
+                        chat_id=chat_id,
+                        message_id=message_id,
+                        text="لوحة التحكم:",
+                        reply_markup=admin_panel_markup()
+                    ))
 
             elif data == "back_to_main":
                 markup = await build_main_menu()
                 if bot and chat_id and message_id:
                     await safe_telegram_call(bot.edit_message_text(
-                        chat_id, message_id, "اختر القسم:", reply_markup=markup))
+                        chat_id=chat_id,
+                        message_id=message_id,
+                        text="اختر القسم:",
+                        reply_markup=markup
+                    ))
 
             elif data in ["admin_add_button", "admin_remove_button", "admin_upload_to_button"]:
                 if user_id in ADMIN_IDS:
                     admin_state[user_id] = {"action": data}
                     if bot and chat_id:
-                        await safe_telegram_call(bot.send_message(chat_id, "أرسل البيانات المطلوبة"))
+                        await safe_telegram_call(bot.send_message(
+                            chat_id=chat_id,
+                            text="أرسل البيانات المطلوبة"
+                        ))
 
             elif data == "admin_list_buttons" and user_id in ADMIN_IDS:
                 try:
                     rows = await db_fetchall("SELECT id, name, callback_data FROM buttons ORDER BY id")
                     text = "\n".join(f"{r['id']}: {r['name']} ({r['callback_data']})" for r in rows)
                     if bot and chat_id:
-                        await safe_telegram_call(bot.send_message(chat_id, text or "لا توجد أزرار"))
+                        await safe_telegram_call(bot.send_message(
+                            chat_id=chat_id,
+                            text=text or "لا توجد أزرار"
+                        ))
                 except Exception as e:
                     logger.error("Failed to list buttons: %s", e)
 
@@ -476,13 +506,13 @@ async def webhook(request: Request):
                     ctype, fid = row["content_type"], row["file_id"]
                     if bot and chat_id:
                         if ctype == "document":
-                            await safe_telegram_call(bot.send_document(chat_id, fid))
+                            await safe_telegram_call(bot.send_document(chat_id=chat_id, document=fid))
                         elif ctype == "photo":
-                            await safe_telegram_call(bot.send_photo(chat_id, fid))
+                            await safe_telegram_call(bot.send_photo(chat_id=chat_id, photo=fid))
                         elif ctype == "video":
-                            await safe_telegram_call(bot.send_video(chat_id, fid))
+                            await safe_telegram_call(bot.send_video(chat_id=chat_id, video=fid))
                         else:
-                            await safe_telegram_call(bot.send_message(chat_id, str(fid)))
+                            await safe_telegram_call(bot.send_message(chat_id=chat_id, text=str(fid)))
                 else:
                     # Show submenu
                     parent = await db_fetchone("SELECT id FROM buttons WHERE callback_data = $1", data)
@@ -497,10 +527,17 @@ async def webhook(request: Request):
                             markup = InlineKeyboardMarkup(keyboard)
                             if bot and chat_id and message_id:
                                 await safe_telegram_call(bot.edit_message_text(
-                                    chat_id, message_id, "اختر:", reply_markup=markup))
+                                    chat_id=chat_id,
+                                    message_id=message_id,
+                                    text="اختر:",
+                                    reply_markup=markup
+                                ))
                         else:
                             if bot and chat_id:
-                                await safe_telegram_call(bot.send_message(chat_id, "لا محتوى"))
+                                await safe_telegram_call(bot.send_message(
+                                    chat_id=chat_id,
+                                    text="لا محتوى"
+                                ))
 
         # Handle messages
         elif "message" in update:
