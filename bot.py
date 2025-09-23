@@ -489,19 +489,19 @@ async def webhook(request: Request):
                 except Exception:
                     if bot and chat_id:
                         await safe_telegram_call(bot.send_message(chat_id, "معلومات غير صحيحة."))
-                    continue
+                    return JSONResponse({"ok": True})
 
                 if user_id not in ADMIN_IDS:
                     if bot and chat_id:
                         await safe_telegram_call(bot.send_message(chat_id, "ليس لديك صلاحية للقيام بهذه العملية."))
-                    continue
+                    return JSONResponse({"ok": True})
 
                 state = admin_state.get(user_id)
                 if not state or state.get("action") != "waiting_confirm_remove_file" or state.get("target_id") != bid:
                     if bot and chat_id:
                         await safe_telegram_call(bot.send_message(chat_id, "لا توجد عملية معلقة أو أنها انتهت."))
                     admin_state.pop(user_id, None)
-                    continue
+                    return JSONResponse({"ok": True})
 
                 try:
                     row = await db_fetchone("SELECT id, name FROM buttons WHERE id = $1", bid)
@@ -509,7 +509,7 @@ async def webhook(request: Request):
                         if bot and chat_id:
                             await safe_telegram_call(bot.send_message(chat_id, f"لا يوجد زر بالمعرف {bid}"))
                         admin_state.pop(user_id, None)
-                        continue
+                        return JSONResponse({"ok": True})
 
                     await db_execute("UPDATE buttons SET content_type = NULL, file_id = NULL WHERE id = $1", bid)
                     if bot and chat_id:
@@ -528,12 +528,12 @@ async def webhook(request: Request):
                 except Exception:
                     if bot and chat_id:
                         await safe_telegram_call(bot.send_message(chat_id, "معلومات غير صحيحة."))
-                    continue
+                    return JSONResponse({"ok": True})
 
                 if user_id not in ADMIN_IDS:
                     if bot and chat_id:
                         await safe_telegram_call(bot.send_message(chat_id, "ليس لديك صلاحية للقيام بهذه العملية."))
-                    continue
+                    return JSONResponse({"ok": True})
 
                 state = admin_state.get(user_id)
                 # Accept cancel even if state mismatches to make UX smoother
