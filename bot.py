@@ -7,10 +7,11 @@ from collections import deque
 from typing import Optional, List, Dict, Any, Tuple
 import asyncpg
 from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import JSONResponse, PlainTextResponse
+from fastapi.responses import JSONResponse, PlainTextResponse, HTMLResponse
 import uvicorn
 from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
 import gc
+from contextlib import asynccontextmanager
 
 # ---------------- Config ----------------
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
@@ -33,12 +34,11 @@ REQUIRED_CHATS_RAW = os.environ.get("REQUIRED_CHATS", "")
 REQUIRED_CHATS: List[str] = [c.strip() for c in REQUIRED_CHATS_RAW.split(",") if c.strip()]
 
 PORT = int(os.environ.get("PORT", 10000))
-DB_POOL_MAX = int(os.environ.get("DB_POOL_MAX", 5))  # Conservative for stability
-MAX_CONCURRENT = int(os.environ.get("MAX_CONCURRENT", 15))  # Reduced for stability
+DB_POOL_MAX = int(os.environ.get("DB_POOL_MAX", 5))
+MAX_CONCURRENT = int(os.environ.get("MAX_CONCURRENT", 15))
 PROCESSING_SEMAPHORE_TIMEOUT = float(os.environ.get("PROCESSING_SEMAPHORE_TIMEOUT", 3.0))
 
 # ---------------- Globals ----------------
-app = FastAPI(docs_url=None, redoc_url=None)
 bot: Optional[Bot] = None
 BOT_ID: Optional[int] = None
 pg_pool: Optional[asyncpg.Pool] = None
@@ -55,7 +55,7 @@ def cleanup_memory():
     """Force garbage collection"""
     gc.collect()
 
-# ---------------- DB helpers with connection limits ----------------
+# ---------------- DB helpers ----------------
 async def init_pg_pool():
     global pg_pool
     if pg_pool:
@@ -85,7 +85,7 @@ async def db_fetchall(query: str, *params):
     if not pg_pool:
         raise RuntimeError("DB pool not initialized")
     try:
-        async with pg_pool.acquire(timeout=5) as conn:  # Add acquire timeout
+        async with pg_pool.acquire(timeout=5) as conn:
             return await conn.fetch(query, *params)
     except asyncio.TimeoutError:
         logger.error("Timeout acquiring database connection")
@@ -132,6 +132,73 @@ async def check_db_health():
         logger.error("Database health check failed: %s", e)
         return False
 
+# ---------------- Lifespan Manager ----------------
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup
+    global bot, BOT_ID, pg_pool
+    
+    logger.info("Starting up...")
+    
+    if not BOT_TOKEN or not DATABASE_URL:
+        logger.error("Missing required environment variables")
+        yield
+        return
+
+    try:
+        await init_pg_pool()
+        await init_db_schema_and_defaults()
+        
+        bot_instance = Bot(token=BOT_TOKEN)
+        me = await bot_instance.get_me()
+        BOT_ID = me.id
+        bot = bot_instance  # Assign to global after successful initialization
+        logger.info("Bot initialized: %s", me.username)
+        
+        if WEBHOOK_URL:
+            webhook_url = f"{WEBHOOK_URL.rstrip('/')}/webhook"
+            if WEBHOOK_SECRET_TOKEN:
+                await bot_instance.set_webhook(webhook_url, secret_token=WEBHOOK_SECRET_TOKEN)
+            else:
+                await bot_instance.set_webhook(webhook_url)
+            logger.info("Webhook set: %s", webhook_url)
+            
+    except Exception as e:
+        logger.error("Startup failed: %s", e)
+        bot = None
+        yield
+        return
+
+    # Application is running
+    yield
+    
+    # Shutdown
+    logger.info("Shutting down...")
+    if pg_pool:
+        await pg_pool.close()
+    if bot:
+        await bot.close()
+
+# Create FastAPI app with lifespan
+app = FastAPI(docs_url=None, redoc_url=None, lifespan=lifespan)
+
+# ---------------- Root endpoint ----------------
+@app.get("/")
+async def root():
+    return HTMLResponse("""
+    <html>
+        <head>
+            <title>Telegram Bot</title>
+        </head>
+        <body>
+            <h1>🤖 Telegram Bot is Running</h1>
+            <p>Bot is active and ready to receive webhook calls.</p>
+            <p><a href="/health">Check Health</a></p>
+            <p><a href="/ping">Ping</a></p>
+        </body>
+    </html>
+    """)
+
 @app.get("/health")
 async def health_check():
     db_healthy = await check_db_health()
@@ -150,7 +217,7 @@ async def health_check():
 async def ping():
     return PlainTextResponse("pong")
 
-# ---------------- Safe Telegram API with better error handling ----------------
+# ---------------- Safe Telegram API ----------------
 async def safe_telegram_call(coro, timeout=10):
     try:
         return await asyncio.wait_for(coro, timeout=timeout)
@@ -454,54 +521,9 @@ async def webhook(request: Request):
             except ValueError:
                 logger.warning("Semaphore release error")
 
-# ---------------- Startup/shutdown ----------------
-from contextlib import asynccontextmanager
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    # Startup
-    logger.info("Starting up...")
-    
-    if not BOT_TOKEN or not DATABASE_URL:
-        logger.error("Missing required environment variables")
-        yield
-        return
-
-    try:
-        await init_pg_pool()
-        await init_db_schema_and_defaults()
-        
-        bot = Bot(token=BOT_TOKEN)
-        me = await safe_telegram_call(bot.get_me())
-        BOT_ID = me.id
-        logger.info("Bot initialized: %s", me.username)
-        
-        if WEBHOOK_URL:
-            webhook_url = f"{WEBHOOK_URL.rstrip('/')}/webhook"
-            if WEBHOOK_SECRET_TOKEN:
-                await safe_telegram_call(bot.set_webhook(webhook_url, secret_token=WEBHOOK_SECRET_TOKEN))
-            else:
-                await safe_telegram_call(bot.set_webhook(webhook_url))
-            logger.info("Webhook set: %s", webhook_url)
-            
-    except Exception as e:
-        logger.error("Startup failed: %s", e)
-        bot = None
-    
-    yield  # This is where the application runs
-    
-    # Shutdown
-    logger.info("Shutting down...")
-    if pg_pool:
-        await pg_pool.close()
-
-# Create FastAPI app with lifespan
-app = FastAPI(docs_url=None, redoc_url=None, lifespan=lifespan)
 # ---------------- Main ----------------
 def main():
     logger.info("Starting server on port %s", PORT)
-    
-    # Remove the unsupported parameters from uvicorn.run()
     uvicorn.run(
         app, 
         host="0.0.0.0", 
@@ -509,5 +531,6 @@ def main():
         log_level="info",
         workers=1
     )
+
 if __name__ == "__main__":
     main()
