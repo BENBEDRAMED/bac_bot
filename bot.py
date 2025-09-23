@@ -455,13 +455,16 @@ async def webhook(request: Request):
                 logger.warning("Semaphore release error")
 
 # ---------------- Startup/shutdown ----------------
-@app.on_event("startup")
-async def on_startup():
-    global bot, BOT_ID
+from contextlib import asynccontextmanager
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup
     logger.info("Starting up...")
     
     if not BOT_TOKEN or not DATABASE_URL:
         logger.error("Missing required environment variables")
+        yield
         return
 
     try:
@@ -484,27 +487,27 @@ async def on_startup():
     except Exception as e:
         logger.error("Startup failed: %s", e)
         bot = None
-
-@app.on_event("shutdown")
-async def on_shutdown():
+    
+    yield  # This is where the application runs
+    
+    # Shutdown
     logger.info("Shutting down...")
     if pg_pool:
         await pg_pool.close()
 
+# Create FastAPI app with lifespan
+app = FastAPI(docs_url=None, redoc_url=None, lifespan=lifespan)
 # ---------------- Main ----------------
 def main():
     logger.info("Starting server on port %s", PORT)
+    
+    # Remove the unsupported parameters from uvicorn.run()
     uvicorn.run(
         app, 
         host="0.0.0.0", 
         port=PORT, 
         log_level="info",
-        # Limit workers for stability
-        workers=1,
-        # Limit request size
-        max_requests=1000,
-        max_requests_jitter=100
+        workers=1
     )
-
 if __name__ == "__main__":
     main()
