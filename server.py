@@ -23,6 +23,10 @@ PROCESSING_SEMAPHORE = asyncio.BoundedSemaphore(MAX_CONCURRENT)
 ACTIVE_REQUESTS = 0
 REQUEST_HISTORY = deque(maxlen=20)
 
+# Heartbeat imports
+import threading
+import sys
+
 def cleanup_memory():
     gc.collect()
 
@@ -34,6 +38,24 @@ async def lifespan(app: FastAPI):
         logger.error("Missing required environment variables")
         yield
         return
+
+# Heartbeat logger
+def heartbeat():
+    while True:
+        logger.info("[HEARTBEAT] Bot process alive")
+        time.sleep(30)
+
+# Start heartbeat in a background thread
+heartbeat_thread = threading.Thread(target=heartbeat, daemon=True)
+heartbeat_thread.start()
+
+# Global exception handler for uncaught exceptions
+def handle_exception(exc_type, exc_value, exc_traceback):
+    if issubclass(exc_type, KeyboardInterrupt):
+        sys.__excepthook__(exc_type, exc_value, exc_traceback)
+        return
+    logger.critical("Uncaught exception", exc_info=(exc_type, exc_value, exc_traceback))
+
 
     try:
         await init_pg_pool()
