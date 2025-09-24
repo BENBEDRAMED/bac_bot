@@ -19,7 +19,7 @@ logging.basicConfig(
     level=getattr(logging, LOG_LEVEL, logging.INFO),
 )
 
-# Globals (keep names consistent with other modules)
+# Globals
 PROCESSED_UPDATES = deque(maxlen=200)
 admin_state = {}
 PROCESSING_SEMAPHORE = asyncio.BoundedSemaphore(MAX_CONCURRENT)
@@ -36,7 +36,6 @@ async def lifespan(app: FastAPI):
     logger.info("Starting up...")
 
     try:
-        # Initialize DB and bot
         await init_pg_pool()
         await init_db_schema_and_defaults()
         await init_bot()
@@ -45,7 +44,7 @@ async def lifespan(app: FastAPI):
         yield
         return
 
-    yield  # application is running
+    yield  # app running
 
     logger.info("Shutting down...")
     try:
@@ -104,17 +103,14 @@ async def webhook(request: Request):
     start_time = time.time()
     update_id = None
 
-    # Validate secret token if configured
     if WEBHOOK_SECRET_TOKEN:
         token = request.headers.get("x-telegram-bot-api-secret-token")
         if token != WEBHOOK_SECRET_TOKEN:
             raise HTTPException(403, "Invalid token")
 
-    # Track request
     ACTIVE_REQUESTS += 1
     REQUEST_HISTORY.append((time.time(), "start"))
 
-    # Acquire semaphore with timeout
     try:
         await asyncio.wait_for(PROCESSING_SEMAPHORE.acquire(), timeout=PROCESSING_SEMAPHORE_TIMEOUT)
         acquired = True
@@ -140,11 +136,10 @@ async def webhook(request: Request):
             return JSONResponse({"ok": True})
         PROCESSED_UPDATES.append(update_id)
 
-        # Periodic garbage collection
         if len(PROCESSED_UPDATES) % 50 == 0:
             cleanup_memory()
 
-        # Callback queries
+        # Handle callback queries
         if "callback_query" in update:
             cq = update["callback_query"]
             data = cq.get("data")
@@ -179,7 +174,7 @@ async def webhook(request: Request):
                             reply_markup=missing_chats_markup()
                         ))
 
-            # admin panel request
+            # admin panel
             elif data == "admin_panel" and user_id in __import__('settings').ADMIN_IDS:
                 if bot and chat_id and message_id:
                     from ui import admin_panel_markup
@@ -208,7 +203,9 @@ async def webhook(request: Request):
 
             elif data == "admin_list_buttons" and user_id in __import__('settings').ADMIN_IDS:
                 try:
-                    rows = await __import__('database').db_fetchall("SELECT id, name, callback_data FROM buttons ORDER BY id")
+                    rows = await __import__('database').db_fetchall(
+                        "SELECT id, name, callback_data FROM buttons ORDER BY id"
+                    )
                     text = "\n".join(f"{r['id']}: {r['name']} ({r['callback_data']})" for r in rows)
                     if bot and chat_id:
                         await safe_telegram_call(bot.send_message(chat_id=chat_id, text=text or "لا توجد أزرار"))
@@ -216,8 +213,10 @@ async def webhook(request: Request):
                     logger.error("Failed to list buttons: %s", e)
 
             else:
-                # Regular button handling: send file or show submenu
-                row = await __import__('database').db_fetchone("SELECT content_type, file_id FROM buttons WHERE callback_data = $1", data)
+                row = await __import__('database').db_fetchone(
+                    "SELECT content_type, file_id FROM buttons WHERE callback_data = $1",
+                    data
+                )
                 if row and row["content_type"] and row["file_id"]:
                     ctype, fid = row["content_type"], row["file_id"]
                     if bot and chat_id:
@@ -230,7 +229,9 @@ async def webhook(request: Request):
                         else:
                             await safe_telegram_call(bot.send_message(chat_id=chat_id, text=str(fid)))
                 else:
-                    parent = await __import__('database').db_fetchone("SELECT id FROM buttons WHERE callback_data = $1", data)
+                    parent = await __import__('database').db_fetchone(
+                        "SELECT id FROM buttons WHERE callback_data = $1", data
+                    )
                     if parent:
                         subs = await __import__('database').db_fetchall(
                             "SELECT name, callback_data FROM buttons WHERE parent_id = $1 ORDER BY id",
@@ -242,12 +243,14 @@ async def webhook(request: Request):
                             keyboard.append([InlineKeyboardButton("العودة", callback_data="back_to_main")])
                             markup = InlineKeyboardMarkup(keyboard)
                             if bot and chat_id and message_id:
-                                await safe_telegram_call(bot.edit_message_text(chat_id=chat_id, message_id=message_id, text="اختر:", reply_markup=markup))
+                                await safe_telegram_call(
+                                    bot.edit_message_text(chat_id=chat_id, message_id=message_id, text="اختر:", reply_markup=markup)
+                                )
                         else:
                             if bot and chat_id:
                                 await safe_telegram_call(bot.send_message(chat_id=chat_id, text="لا محتوى"))
 
-        # Normal messages
+        # Handle normal messages
         elif "message" in update:
             await process_text_message(update["message"], admin_state)
         elif "edited_message" in update:
