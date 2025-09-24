@@ -123,45 +123,44 @@ async def health_check():
     }, status_code=status_code)
 
 @app.get("/ping")
-async def ping():
-    return PlainTextResponse("pong")
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    logger.info("Starting up...")
 
-@app.post("/webhook")
-async def webhook(request: Request):
-    global ACTIVE_REQUESTS
-    acquired = False
-    start_time = time.time()
-    update_id = None
-    
-    if WEBHOOK_SECRET_TOKEN:
-        token = request.headers.get("x-telegram-bot-api-secret-token")
-        if token != WEBHOOK_SECRET_TOKEN:
-            raise HTTPException(403, "Invalid token")
+    async def startup():
+        if not BOT_TOKEN or not DATABASE_URL:
+            logger.error("Missing required environment variables")
+            return False
+        try:
+            await init_pg_pool()
+            await init_db_schema_and_defaults()
+            await init_bot()  # This sets the global bot instance in telegram_client
 
-    ACTIVE_REQUESTS += 1
-    REQUEST_HISTORY.append((time.time(), "start"))
-    
-    try:
-        logger.debug(f"Waiting for semaphore. Available: {PROCESSING_SEMAPHORE._value}")
-        await asyncio.wait_for(PROCESSING_SEMAPHORE.acquire(), timeout=PROCESSING_SEMAPHORE_TIMEOUT)
-        acquired = True
-        ACTIVE_REQUESTS -= 1
-        logger.debug(f"Semaphore acquired. Available: {PROCESSING_SEMAPHORE._value}")
-        REQUEST_HISTORY.append((time.time(), "acquired"))
-    except asyncio.TimeoutError:
-        ACTIVE_REQUESTS -= 1
-        logger.warning("Server busy, rejecting request - semaphore timeout")
-        REQUEST_HISTORY.append((time.time(), "timeout"))
-        return JSONResponse({"ok": False, "error": "busy"}, status_code=429)
-    except Exception as e:
-        ACTIVE_REQUESTS -= 1
-        logger.error(f"Unexpected error acquiring semaphore: {e}")
-        REQUEST_HISTORY.append((time.time(), "error"))
-        return JSONResponse({"ok": False, "error": "internal"}, status_code=500)
+            bot_instance = get_bot()
+            if WEBHOOK_URL and bot_instance:
+                webhook_url = f"{WEBHOOK_URL.rstrip('/')}/webhook"
+                if WEBHOOK_SECRET_TOKEN:
+                    await bot_instance.set_webhook(webhook_url, secret_token=WEBHOOK_SECRET_TOKEN)
+                else:
+                    await bot_instance.set_webhook(webhook_url)
+                logger.info("Webhook set: %s", webhook_url)
+            return True
+        except Exception as e:
+            logger.error("Startup failed: %s", e)
+            return False
 
-    try:
-        update = await request.json()
-        update_id = update.get("update_id")
+    started = await startup()
+    yield
+
+    logger.info("Shutting down...")
+    from database import pg_pool
+    if pg_pool:
+        await pg_pool.close()
+    bot_instance = get_bot()
+    if bot_instance:
+        await bot_instance.close()
+
+app.router.lifespan_context = lifespan
         
         logger.info(f"Processing update {update_id}")
         
