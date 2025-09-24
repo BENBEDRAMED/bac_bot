@@ -10,7 +10,7 @@ import uvicorn
 
 from settings import PORT, MAX_CONCURRENT, PROCESSING_SEMAPHORE_TIMEOUT, WEBHOOK_SECRET_TOKEN, WEBHOOK_URL, BOT_TOKEN, DATABASE_URL
 from database import init_pg_pool, init_db_schema_and_defaults, check_db_health
-from telegram_client import bot, safe_telegram_call
+from telegram_client import init_bot, get_bot, get_bot_id
 from handlers import process_text_message, handle_callback_query
 from telegram import Bot
 
@@ -22,15 +22,12 @@ PROCESSED_UPDATES = deque(maxlen=200)
 PROCESSING_SEMAPHORE = asyncio.BoundedSemaphore(MAX_CONCURRENT)
 ACTIVE_REQUESTS = 0
 REQUEST_HISTORY = deque(maxlen=20)
-BOT_ID = None
 
 def cleanup_memory():
     gc.collect()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global bot, BOT_ID
-    
     logger.info("Starting up...")
     
     if not BOT_TOKEN or not DATABASE_URL:
@@ -41,14 +38,10 @@ async def lifespan(app: FastAPI):
     try:
         await init_pg_pool()
         await init_db_schema_and_defaults()
+        await init_bot()  # This sets the global bot instance in telegram_client
         
-        bot_instance = Bot(token=BOT_TOKEN)
-        me = await bot_instance.get_me()
-        BOT_ID = me.id
-        bot = bot_instance
-        logger.info("Bot initialized: %s", me.username)
-        
-        if WEBHOOK_URL:
+        bot_instance = get_bot()
+        if WEBHOOK_URL and bot_instance:
             webhook_url = f"{WEBHOOK_URL.rstrip('/')}/webhook"
             if WEBHOOK_SECRET_TOKEN:
                 await bot_instance.set_webhook(webhook_url, secret_token=WEBHOOK_SECRET_TOKEN)
@@ -58,7 +51,6 @@ async def lifespan(app: FastAPI):
             
     except Exception as e:
         logger.error("Startup failed: %s", e)
-        bot = None
         yield
         return
 
@@ -68,8 +60,9 @@ async def lifespan(app: FastAPI):
     from database import pg_pool
     if pg_pool:
         await pg_pool.close()
-    if bot:
-        await bot.close()
+    bot_instance = get_bot()
+    if bot_instance:
+        await bot_instance.close()
 
 app.router.lifespan_context = lifespan
 
@@ -93,7 +86,7 @@ async def root():
 async def health_check():
     global ACTIVE_REQUESTS
     db_healthy = await check_db_health()
-    bot_healthy = bot is not None
+    bot_healthy = get_bot() is not None
     
     status_code = 200 if db_healthy and bot_healthy else 503
     return JSONResponse({

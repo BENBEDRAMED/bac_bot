@@ -2,7 +2,7 @@ import time
 from typing import Dict, Any, Tuple, List
 from database import db_execute, db_fetchone, db_fetchall
 from ui import build_main_menu, missing_chats_markup, admin_panel_markup
-from telegram_client import bot, safe_telegram_call
+from telegram_client import safe_telegram_call, get_bot, get_bot_id
 from settings import ADMIN_IDS, REQUIRED_CHATS
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 import logging
@@ -12,7 +12,8 @@ logger = logging.getLogger(__name__)
 admin_state: Dict[int, Dict[str, Any]] = {}
 
 async def check_user_membership(user_id: int) -> Tuple[bool, List[str], Dict[str, str]]:
-    if not REQUIRED_CHATS:
+    bot = get_bot()
+    if not REQUIRED_CHATS or not bot:
         return True, [], {}
         
     missing = []
@@ -34,18 +35,23 @@ async def check_user_membership(user_id: int) -> Tuple[bool, List[str], Dict[str
     return len(missing) == 0, missing, reasons
 
 async def process_text_message(msg: dict):
+    bot = get_bot()
+    BOT_ID = get_bot_id()
+    
     text = msg.get("text")
     chat = msg.get("chat", {})
     chat_id = chat.get("id")
     from_user = msg.get("from", {})
     user_id = from_user.get("id")
 
-    if not text or not chat_id or not user_id:
+    if not text or not chat_id or not user_id or not bot:
         return
 
-    if from_user.get("is_bot"):
+    # Ignore bot messages including the bot itself
+    if from_user.get("is_bot") or (BOT_ID and from_user.get("id") == BOT_ID):
         return
 
+    # Admin flows
     if user_id in admin_state:
         state = admin_state[user_id]
         action = state.get("action")
@@ -58,39 +64,36 @@ async def process_text_message(msg: dict):
                 callback_data = f"btn_{int(time.time())}_{hash(name)}"
                 await db_execute("INSERT INTO buttons (name, callback_data, parent_id) VALUES ($1,$2,$3)", 
                                name, callback_data, parent_id)
-                if bot:
-                    await safe_telegram_call(bot.send_message(chat_id=chat_id, text=f"تم إضافة الزر '{name}'"))
+                await safe_telegram_call(bot.send_message(chat_id=chat_id, text=f"تم إضافة الزر '{name}'"))
                 admin_state.pop(user_id, None)
             except Exception as e:
                 logger.error("Failed to add button: %s", e)
-                if bot:
-                    await safe_telegram_call(bot.send_message(chat_id=chat_id, text="خطأ في الإضافة"))
+                await safe_telegram_call(bot.send_message(chat_id=chat_id, text="خطأ في الإضافة"))
             return
 
         elif action == "awaiting_remove":
             try:
                 bid = int(text.strip())
                 await db_execute("DELETE FROM buttons WHERE id = $1", bid)
-                if bot:
-                    await safe_telegram_call(bot.send_message(chat_id=chat_id, text="تم الحذف"))
+                await safe_telegram_call(bot.send_message(chat_id=chat_id, text="تم الحذف"))
                 admin_state.pop(user_id, None)
             except Exception:
-                if bot:
-                    await safe_telegram_call(bot.send_message(chat_id=chat_id, text="خطأ في الحذف"))
+                await safe_telegram_call(bot.send_message(chat_id=chat_id, text="خطأ في الحذف"))
             return
 
+    # Start command
     if text.strip().lower().startswith("/start"):
         ok, missing, reasons = await check_user_membership(user_id)
         if not ok:
             message = "✋ يلزم الانضمام إلى:\n" + "\n".join(f"- {c}" for c in missing) + "\n\nاضغط 'لقد انضممت — تحقق'"
-            if bot:
-                await safe_telegram_call(bot.send_message(
-                    chat_id=chat_id, 
-                    text=message, 
-                    reply_markup=missing_chats_markup()
-                ))
+            await safe_telegram_call(bot.send_message(
+                chat_id=chat_id, 
+                text=message, 
+                reply_markup=missing_chats_markup()
+            ))
             return
 
+        # Save user and show menu
         try:
             await db_execute("INSERT INTO users (user_id, first_name) VALUES ($1,$2) ON CONFLICT DO NOTHING", 
                            user_id, from_user.get("first_name", ""))
@@ -98,7 +101,7 @@ async def process_text_message(msg: dict):
             pass
 
         markup = await build_main_menu()
-        if bot and markup:
+        if markup:
             await safe_telegram_call(bot.send_message(
                 chat_id=chat_id, 
                 text="مرحباً! اختر القسم:", 
@@ -106,6 +109,11 @@ async def process_text_message(msg: dict):
             ))
 
 async def handle_callback_query(cq: dict):
+    bot = get_bot()
+    if not bot:
+        logger.error("Bot instance not available")
+        return
+        
     data = cq.get("data")
     user_id = cq.get("from", {}).get("id")
     message = cq.get("message", {})
@@ -114,14 +122,16 @@ async def handle_callback_query(cq: dict):
 
     logger.debug(f"Callback query: {data} from user {user_id}")
 
-    if bot and cq.get("id"):
+    # Answer callback first
+    if cq.get("id"):
         await safe_telegram_call(bot.answer_callback_query(callback_query_id=cq["id"]))
 
+    # Handle different callback actions
     if data == "check_membership":
         ok, missing, _ = await check_user_membership(user_id)
         if ok:
             markup = await build_main_menu()
-            if bot and chat_id and message_id:
+            if chat_id and message_id:
                 await safe_telegram_call(bot.edit_message_text(
                     chat_id=chat_id,
                     message_id=message_id,
@@ -129,7 +139,7 @@ async def handle_callback_query(cq: dict):
                     reply_markup=markup
                 ))
         else:
-            if bot and chat_id and message_id:
+            if chat_id and message_id:
                 await safe_telegram_call(bot.edit_message_text(
                     chat_id=chat_id,
                     message_id=message_id,
@@ -138,7 +148,7 @@ async def handle_callback_query(cq: dict):
                 ))
 
     elif data == "admin_panel" and user_id in ADMIN_IDS:
-        if bot and chat_id and message_id:
+        if chat_id and message_id:
             await safe_telegram_call(bot.edit_message_text(
                 chat_id=chat_id,
                 message_id=message_id,
@@ -148,7 +158,7 @@ async def handle_callback_query(cq: dict):
 
     elif data == "back_to_main":
         markup = await build_main_menu()
-        if bot and chat_id and message_id:
+        if chat_id and message_id:
             await safe_telegram_call(bot.edit_message_text(
                 chat_id=chat_id,
                 message_id=message_id,
@@ -159,7 +169,7 @@ async def handle_callback_query(cq: dict):
     elif data in ["admin_add_button", "admin_remove_button", "admin_upload_to_button"]:
         if user_id in ADMIN_IDS:
             admin_state[user_id] = {"action": data}
-            if bot and chat_id:
+            if chat_id:
                 await safe_telegram_call(bot.send_message(
                     chat_id=chat_id,
                     text="أرسل البيانات المطلوبة"
@@ -169,7 +179,7 @@ async def handle_callback_query(cq: dict):
         try:
             rows = await db_fetchall("SELECT id, name, callback_data FROM buttons ORDER BY id")
             text = "\n".join(f"{r['id']}: {r['name']} ({r['callback_data']})" for r in rows)
-            if bot and chat_id:
+            if chat_id:
                 await safe_telegram_call(bot.send_message(
                     chat_id=chat_id,
                     text=text or "لا توجد أزرار"
@@ -178,10 +188,11 @@ async def handle_callback_query(cq: dict):
             logger.error("Failed to list buttons: %s", e)
 
     else:
+        # Regular button handling
         row = await db_fetchone("SELECT content_type, file_id FROM buttons WHERE callback_data = $1", data)
         if row and row["content_type"] and row["file_id"]:
             ctype, fid = row["content_type"], row["file_id"]
-            if bot and chat_id:
+            if chat_id:
                 if ctype == "document":
                     await safe_telegram_call(bot.send_document(chat_id=chat_id, document=fid))
                 elif ctype == "photo":
@@ -191,6 +202,7 @@ async def handle_callback_query(cq: dict):
                 else:
                     await safe_telegram_call(bot.send_message(chat_id=chat_id, text=str(fid)))
         else:
+            # Show submenu
             parent = await db_fetchone("SELECT id FROM buttons WHERE callback_data = $1", data)
             if parent:
                 subs = await db_fetchall(
@@ -201,7 +213,7 @@ async def handle_callback_query(cq: dict):
                     keyboard = [[InlineKeyboardButton(s["name"], callback_data=s["callback_data"])] for s in subs]
                     keyboard.append([InlineKeyboardButton("العودة", callback_data="back_to_main")])
                     markup = InlineKeyboardMarkup(keyboard)
-                    if bot and chat_id and message_id:
+                    if chat_id and message_id:
                         await safe_telegram_call(bot.edit_message_text(
                             chat_id=chat_id,
                             message_id=message_id,
@@ -209,7 +221,7 @@ async def handle_callback_query(cq: dict):
                             reply_markup=markup
                         ))
                 else:
-                    if bot and chat_id:
+                    if chat_id:
                         await safe_telegram_call(bot.send_message(
                             chat_id=chat_id,
                             text="لا محتوى"
