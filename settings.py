@@ -1,7 +1,6 @@
 import os
-from typing import List, Optional
+from typing import Optional, List
 
-# ---------------- Config ----------------
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
 
 BOT_TOKEN: Optional[str] = os.environ.get("BOT_TOKEN")

@@ -1,8 +1,7 @@
-import logging
 import asyncpg
-from typing import List, Dict, Any , Optional
+from typing import Optional
 from settings import DATABASE_URL, DB_POOL_MAX
-
+import logging
 
 logger = logging.getLogger(__name__)
 
@@ -39,9 +38,6 @@ async def db_fetchall(query: str, *params):
     try:
         async with pg_pool.acquire(timeout=5) as conn:
             return await conn.fetch(query, *params)
-    except asyncio.TimeoutError:
-        logger.error("Timeout acquiring database connection")
-        raise
     except Exception as e:
         logger.error("Database query failed: %s", e)
         raise
@@ -52,9 +48,6 @@ async def db_fetchone(query: str, *params):
     try:
         async with pg_pool.acquire(timeout=5) as conn:
             return await conn.fetchrow(query, *params)
-    except asyncio.TimeoutError:
-        logger.error("Timeout acquiring database connection")
-        raise
     except Exception as e:
         logger.error("Database query failed: %s", e)
         raise
@@ -65,9 +58,6 @@ async def db_execute(query: str, *params):
     try:
         async with pg_pool.acquire(timeout=5) as conn:
             return await conn.execute(query, *params)
-    except asyncio.TimeoutError:
-        logger.error("Timeout acquiring database connection")
-        raise
     except Exception as e:
         logger.error("Database execute failed: %s", e)
         raise
@@ -107,7 +97,6 @@ async def init_db_schema_and_defaults():
             )
         """)
         
-        # Insert defaults only if they don't exist
         defaults = [("العلمي", "science", 0), ("الأدبي", "literary", 0), ("الإدارة", "admin_panel", 0)]
         for name, cb, parent in defaults:
             await db_execute(

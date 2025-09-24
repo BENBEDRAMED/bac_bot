@@ -1,5 +1,8 @@
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from database import db_fetchall
+import logging
+
+logger = logging.getLogger(__name__)
 
 def rows_to_markup(rows):
     if not rows:

@@ -1,15 +1,14 @@
 import os
 import logging
-from settings import LOG_LEVEL, MAX_CONCURRENT ,PORT # Added MAX_CONCURRENT import
-from server import app # Import the FastAPI app
-# Setup logging
+from settings import LOG_LEVEL, PORT, MAX_CONCURRENT
+
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=getattr(logging, LOG_LEVEL, logging.INFO),
 )
 logger = logging.getLogger(__name__)
 
-
+from server import app
 
 def main():
     logger.info("Starting server on port %s with max_concurrent=%s", PORT, MAX_CONCURRENT)

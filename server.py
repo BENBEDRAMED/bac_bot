@@ -8,31 +8,31 @@ from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse, PlainTextResponse, HTMLResponse
 import uvicorn
 
-from settings import PORT, MAX_CONCURRENT, PROCESSING_SEMAPHORE_TIMEOUT, WEBHOOK_SECRET_TOKEN, WEBHOOK_URL
+from settings import PORT, MAX_CONCURRENT, PROCESSING_SEMAPHORE_TIMEOUT, WEBHOOK_SECRET_TOKEN, WEBHOOK_URL, BOT_TOKEN, DATABASE_URL
 from database import init_pg_pool, init_db_schema_and_defaults, check_db_health
-from telegram_client import init_bot, bot
+from telegram_client import bot, safe_telegram_call
 from handlers import process_text_message, handle_callback_query
+from telegram import Bot
 
 logger = logging.getLogger(__name__)
 
 app = FastAPI(docs_url=None, redoc_url=None)
 
-# Global variables
 PROCESSED_UPDATES = deque(maxlen=200)
 PROCESSING_SEMAPHORE = asyncio.BoundedSemaphore(MAX_CONCURRENT)
 ACTIVE_REQUESTS = 0
 REQUEST_HISTORY = deque(maxlen=20)
+BOT_ID = None
 
 def cleanup_memory():
-    """Force garbage collection"""
     gc.collect()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup
+    global bot, BOT_ID
+    
     logger.info("Starting up...")
     
-    from settings import BOT_TOKEN, DATABASE_URL
     if not BOT_TOKEN or not DATABASE_URL:
         logger.error("Missing required environment variables")
         yield
@@ -41,25 +41,29 @@ async def lifespan(app: FastAPI):
     try:
         await init_pg_pool()
         await init_db_schema_and_defaults()
-        await init_bot()
+        
+        bot_instance = Bot(token=BOT_TOKEN)
+        me = await bot_instance.get_me()
+        BOT_ID = me.id
+        bot = bot_instance
+        logger.info("Bot initialized: %s", me.username)
         
         if WEBHOOK_URL:
             webhook_url = f"{WEBHOOK_URL.rstrip('/')}/webhook"
             if WEBHOOK_SECRET_TOKEN:
-                await bot.set_webhook(webhook_url, secret_token=WEBHOOK_SECRET_TOKEN)
+                await bot_instance.set_webhook(webhook_url, secret_token=WEBHOOK_SECRET_TOKEN)
             else:
-                await bot.set_webhook(webhook_url)
+                await bot_instance.set_webhook(webhook_url)
             logger.info("Webhook set: %s", webhook_url)
             
     except Exception as e:
         logger.error("Startup failed: %s", e)
+        bot = None
         yield
         return
 
-    # Application is running
     yield
     
-    # Shutdown
     logger.info("Shutting down...")
     from database import pg_pool
     if pg_pool:
@@ -114,17 +118,14 @@ async def webhook(request: Request):
     start_time = time.time()
     update_id = None
     
-    # Validate secret token
     if WEBHOOK_SECRET_TOKEN:
         token = request.headers.get("x-telegram-bot-api-secret-token")
         if token != WEBHOOK_SECRET_TOKEN:
             raise HTTPException(403, "Invalid token")
 
-    # Track request
     ACTIVE_REQUESTS += 1
     REQUEST_HISTORY.append((time.time(), "start"))
     
-    # Acquire semaphore with timeout
     try:
         logger.debug(f"Waiting for semaphore. Available: {PROCESSING_SEMAPHORE._value}")
         await asyncio.wait_for(PROCESSING_SEMAPHORE.acquire(), timeout=PROCESSING_SEMAPHORE_TIMEOUT)
@@ -144,7 +145,6 @@ async def webhook(request: Request):
         return JSONResponse({"ok": False, "error": "internal"}, status_code=500)
 
     try:
-        # Parse update
         update = await request.json()
         update_id = update.get("update_id")
         
@@ -155,15 +155,12 @@ async def webhook(request: Request):
             return JSONResponse({"ok": True})
         PROCESSED_UPDATES.append(update_id)
 
-        # Clean memory periodically
         if len(PROCESSED_UPDATES) % 50 == 0:
             cleanup_memory()
 
-        # Handle callback queries
         if "callback_query" in update:
             await handle_callback_query(update["callback_query"])
 
-        # Handle messages
         elif "message" in update:
             await process_text_message(update["message"])
         elif "edited_message" in update:

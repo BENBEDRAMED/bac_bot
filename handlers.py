@@ -1,11 +1,11 @@
 import time
-import logging
 from typing import Dict, Any, Tuple, List
 from database import db_execute, db_fetchone, db_fetchall
 from ui import build_main_menu, missing_chats_markup, admin_panel_markup
 from telegram_client import bot, safe_telegram_call
 from settings import ADMIN_IDS, REQUIRED_CHATS
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+import logging
 
 logger = logging.getLogger(__name__)
 
@@ -43,11 +43,9 @@ async def process_text_message(msg: dict):
     if not text or not chat_id or not user_id:
         return
 
-    # Ignore bot messages
     if from_user.get("is_bot"):
         return
 
-    # Admin flows
     if user_id in admin_state:
         state = admin_state[user_id]
         action = state.get("action")
@@ -81,7 +79,6 @@ async def process_text_message(msg: dict):
                     await safe_telegram_call(bot.send_message(chat_id=chat_id, text="خطأ في الحذف"))
             return
 
-    # Start command
     if text.strip().lower().startswith("/start"):
         ok, missing, reasons = await check_user_membership(user_id)
         if not ok:
@@ -94,12 +91,11 @@ async def process_text_message(msg: dict):
                 ))
             return
 
-        # Save user and show menu
         try:
             await db_execute("INSERT INTO users (user_id, first_name) VALUES ($1,$2) ON CONFLICT DO NOTHING", 
                            user_id, from_user.get("first_name", ""))
         except Exception:
-            pass  # Ignore user save errors
+            pass
 
         markup = await build_main_menu()
         if bot and markup:
@@ -118,11 +114,9 @@ async def handle_callback_query(cq: dict):
 
     logger.debug(f"Callback query: {data} from user {user_id}")
 
-    # Answer callback first
     if bot and cq.get("id"):
         await safe_telegram_call(bot.answer_callback_query(callback_query_id=cq["id"]))
 
-    # Handle different callback actions
     if data == "check_membership":
         ok, missing, _ = await check_user_membership(user_id)
         if ok:
@@ -184,7 +178,6 @@ async def handle_callback_query(cq: dict):
             logger.error("Failed to list buttons: %s", e)
 
     else:
-        # Regular button handling
         row = await db_fetchone("SELECT content_type, file_id FROM buttons WHERE callback_data = $1", data)
         if row and row["content_type"] and row["file_id"]:
             ctype, fid = row["content_type"], row["file_id"]
@@ -198,7 +191,6 @@ async def handle_callback_query(cq: dict):
                 else:
                     await safe_telegram_call(bot.send_message(chat_id=chat_id, text=str(fid)))
         else:
-            # Show submenu
             parent = await db_fetchone("SELECT id FROM buttons WHERE callback_data = $1", data)
             if parent:
                 subs = await db_fetchall(

@@ -1,9 +1,9 @@
 import time
 import asyncio
-import logging
 from telegram import Bot
 from telegram.error import RetryAfter
 from settings import BOT_TOKEN, MIN_REQUEST_INTERVAL
+import logging
 
 logger = logging.getLogger(__name__)
 
@@ -11,20 +11,7 @@ bot: Bot = None
 BOT_ID: int = None
 LAST_REQUEST_TIME = 0
 
-async def init_bot():
-    global bot, BOT_ID
-    if not BOT_TOKEN:
-        raise ValueError("BOT_TOKEN not set")
-    
-    bot_instance = Bot(token=BOT_TOKEN)
-    me = await bot_instance.get_me()
-    BOT_ID = me.id
-    bot = bot_instance
-    logger.info("Bot initialized: %s", me.username)
-    return bot
-
 async def rate_limit():
-    """Add small delay between requests to avoid rate limiting"""
     global LAST_REQUEST_TIME
     current_time = time.time()
     elapsed = current_time - LAST_REQUEST_TIME
