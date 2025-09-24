@@ -6,7 +6,7 @@ from telegram_client import safe_telegram_call, get_bot, get_bot_id
 from settings import ADMIN_IDS, REQUIRED_CHATS
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 import logging
-from handlers import handle_callback_query, process_text_message
+
 
 
 logger = logging.getLogger(__name__)
