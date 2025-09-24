@@ -611,12 +611,7 @@ def main():
         host="0.0.0.0", 
         port=PORT, 
         log_level="info",
-        workers=1,
-        # Add uvicorn configuration for better stability
-        loop="asyncio",
-        access_log=True,
-        timeout_keep_alive=5,
-        timeout_notify=30
+        workers=1
     )
 
 if __name__ == "__main__":
