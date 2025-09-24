@@ -5,6 +5,7 @@ from database import db_execute, db_fetchone, db_fetchall
 from ui import build_main_menu, missing_chats_markup, admin_panel_markup
 from telegram_client import bot, safe_telegram_call
 from settings import ADMIN_IDS, REQUIRED_CHATS
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
 logger = logging.getLogger(__name__)
 

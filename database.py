@@ -1,7 +1,8 @@
 import logging
 import asyncpg
-from typing import List, Dict, Any
+from typing import List, Dict, Any , Optional
 from settings import DATABASE_URL, DB_POOL_MAX
+
 
 logger = logging.getLogger(__name__)
 
