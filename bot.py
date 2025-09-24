@@ -35,8 +35,8 @@ REQUIRED_CHATS: List[str] = [c.strip() for c in REQUIRED_CHATS_RAW.split(",") if
 
 PORT = int(os.environ.get("PORT", 10000))
 DB_POOL_MAX = int(os.environ.get("DB_POOL_MAX", 5))
-MAX_CONCURRENT = int(os.environ.get("MAX_CONCURRENT", 15))
-PROCESSING_SEMAPHORE_TIMEOUT = float(os.environ.get("PROCESSING_SEMAPHORE_TIMEOUT", 3.0))
+MAX_CONCURRENT = int(os.environ.get("MAX_CONCURRENT", 10))  # Reduced for stability
+PROCESSING_SEMAPHORE_TIMEOUT = float(os.environ.get("PROCESSING_SEMAPHORE_TIMEOUT", 5.0))
 
 # ---------------- Globals ----------------
 bot: Optional[Bot] = None
@@ -44,16 +44,30 @@ BOT_ID: Optional[int] = None
 pg_pool: Optional[asyncpg.Pool] = None
 
 # Use smaller deque to save memory
-PROCESSED_UPDATES = deque(maxlen=1000)
+PROCESSED_UPDATES = deque(maxlen=500)  # Reduced size
 admin_state: Dict[int, Dict[str, Any]] = {}
 
-# Use Semaphore instead of BoundedSemaphore for better error handling
+# Use Semaphore with better handling
 PROCESSING_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT)
+
+# Rate limiting
+LAST_REQUEST_TIME = 0
+MIN_REQUEST_INTERVAL = 0.1  # 100ms between requests
 
 # ---------------- Memory management ----------------
 def cleanup_memory():
     """Force garbage collection"""
     gc.collect()
+
+# ---------------- Rate limiting ----------------
+async def rate_limit():
+    """Add small delay between requests to avoid rate limiting"""
+    global LAST_REQUEST_TIME
+    current_time = time.time()
+    elapsed = current_time - LAST_REQUEST_TIME
+    if elapsed < MIN_REQUEST_INTERVAL:
+        await asyncio.sleep(MIN_REQUEST_INTERVAL - elapsed)
+    LAST_REQUEST_TIME = time.time()
 
 # ---------------- DB helpers ----------------
 async def init_pg_pool():
@@ -152,7 +166,7 @@ async def lifespan(app: FastAPI):
         bot_instance = Bot(token=BOT_TOKEN)
         me = await bot_instance.get_me()
         BOT_ID = me.id
-        bot = bot_instance  # Assign to global after successful initialization
+        bot = bot_instance
         logger.info("Bot initialized: %s", me.username)
         
         if WEBHOOK_URL:
@@ -210,23 +224,32 @@ async def health_check():
         "database": "connected" if db_healthy else "disconnected",
         "bot": "connected" if bot_healthy else "disconnected",
         "active_requests": MAX_CONCURRENT - PROCESSING_SEMAPHORE._value,
-        "memory_usage": f"{gc.mem_alloc() / 1024 / 1024:.1f}MB"
+        "memory_usage": f"{gc.mem_alloc() / 1024 / 1024:.1f}MB",
+        "processed_updates": len(PROCESSED_UPDATES)
     }, status_code=status_code)
 
 @app.get("/ping")
 async def ping():
     return PlainTextResponse("pong")
 
-# ---------------- Safe Telegram API ----------------
-async def safe_telegram_call(coro, timeout=10):
-    try:
-        return await asyncio.wait_for(coro, timeout=timeout)
-    except asyncio.TimeoutError:
-        logger.warning("Telegram API timeout after %s seconds", timeout)
-        raise
-    except Exception as e:
-        logger.warning("Telegram API error: %s", e)
-        raise
+# ---------------- Safe Telegram API with better error handling ----------------
+async def safe_telegram_call(coro, timeout=10, max_retries=2):
+    for attempt in range(max_retries + 1):
+        try:
+            await rate_limit()  # Add rate limiting between Telegram API calls
+            return await asyncio.wait_for(coro, timeout=timeout)
+        except asyncio.TimeoutError:
+            if attempt == max_retries:
+                logger.warning("Telegram API timeout after %s seconds (attempt %s)", timeout, attempt + 1)
+                raise
+            logger.info("Telegram API timeout, retrying...")
+            await asyncio.sleep(0.5)
+        except Exception as e:
+            if attempt == max_retries:
+                logger.warning("Telegram API error: %s (attempt %s)", e, attempt + 1)
+                raise
+            logger.info("Telegram API error, retrying...")
+            await asyncio.sleep(0.5)
 
 # ---------------- Init schema ----------------
 async def init_db_schema_and_defaults():
@@ -393,10 +416,12 @@ async def process_text_message(msg: dict):
                 reply_markup=markup
             ))
 
-# ---------------- Webhook handler ----------------
+# ---------------- Webhook handler with improved semaphore handling ----------------
 @app.post("/webhook")
 async def webhook(request: Request):
     acquired = False
+    start_time = time.time()
+    update_id = None
     
     # Validate secret token
     if WEBHOOK_SECRET_TOKEN:
@@ -404,25 +429,33 @@ async def webhook(request: Request):
         if token != WEBHOOK_SECRET_TOKEN:
             raise HTTPException(403, "Invalid token")
 
-    # Acquire semaphore with timeout
+    # Acquire semaphore with timeout and better error handling
     try:
+        logger.debug(f"Waiting for semaphore. Available: {PROCESSING_SEMAPHORE._value}")
         await asyncio.wait_for(PROCESSING_SEMAPHORE.acquire(), timeout=PROCESSING_SEMAPHORE_TIMEOUT)
         acquired = True
+        logger.debug(f"Semaphore acquired. Available: {PROCESSING_SEMAPHORE._value}")
     except asyncio.TimeoutError:
-        logger.warning("Server busy, rejecting request")
+        logger.warning("Server busy, rejecting request - semaphore timeout")
         return JSONResponse({"ok": False, "error": "busy"}, status_code=429)
+    except Exception as e:
+        logger.error(f"Unexpected error acquiring semaphore: {e}")
+        return JSONResponse({"ok": False, "error": "internal"}, status_code=500)
 
     try:
         # Parse update
         update = await request.json()
         update_id = update.get("update_id")
         
+        logger.info(f"Processing update {update_id}")
+        
         if update_id and update_id in PROCESSED_UPDATES:
+            logger.debug(f"Duplicate update {update_id}, skipping")
             return JSONResponse({"ok": True})
         PROCESSED_UPDATES.append(update_id)
 
         # Clean memory periodically
-        if len(PROCESSED_UPDATES) % 100 == 0:
+        if len(PROCESSED_UPDATES) % 50 == 0:
             cleanup_memory()
 
         # Handle callback queries
@@ -433,6 +466,8 @@ async def webhook(request: Request):
             message = cq.get("message", {})
             chat_id = message.get("chat", {}).get("id")
             message_id = message.get("message_id")
+
+            logger.debug(f"Callback query: {data} from user {user_id}")
 
             # Answer callback first
             if bot and cq.get("id"):
@@ -545,18 +580,28 @@ async def webhook(request: Request):
         elif "edited_message" in update:
             await process_text_message(update["edited_message"])
 
+        processing_time = time.time() - start_time
+        logger.info(f"Successfully processed update {update_id} in {processing_time:.2f}s")
         return JSONResponse({"ok": True})
 
     except Exception as e:
-        logger.error("Webhook error: %s", e)
+        logger.error(f"Webhook error for update {update_id}: {e}")
         return JSONResponse({"ok": False, "error": "internal"}, status_code=500)
         
     finally:
         if acquired:
             try:
                 PROCESSING_SEMAPHORE.release()
-            except ValueError:
-                logger.warning("Semaphore release error")
+                logger.debug(f"Semaphore released. Available: {PROCESSING_SEMAPHORE._value}")
+            except ValueError as e:
+                logger.error(f"Error releasing semaphore: {e}")
+                # Reset semaphore if it's in a bad state
+                try:
+                    while PROCESSING_SEMAPHORE._value < MAX_CONCURRENT:
+                        PROCESSING_SEMAPHORE.release()
+                    logger.warning("Semaphore reset to max value")
+                except:
+                    pass
 
 # ---------------- Main ----------------
 def main():
@@ -566,7 +611,12 @@ def main():
         host="0.0.0.0", 
         port=PORT, 
         log_level="info",
-        workers=1
+        workers=1,
+        # Add uvicorn configuration for better stability
+        loop="asyncio",
+        access_log=True,
+        timeout_keep_alive=5,
+        timeout_notify=30
     )
 
 if __name__ == "__main__":
