@@ -10,7 +10,7 @@ from contextlib import asynccontextmanager
 from database import init_pg_pool, init_db_schema_and_defaults, check_db_health, pg_pool
 from telegram_client import init_bot, get_bot
 from settings import BOT_TOKEN, DATABASE_URL, WEBHOOK_URL, WEBHOOK_SECRET_TOKEN, MAX_CONCURRENT
-
+from handlers import handle_callback_query, process_text_message
 import logging
 logger = logging.getLogger(__name__)
 
