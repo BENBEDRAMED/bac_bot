@@ -10,6 +10,7 @@ from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse, PlainTextResponse, HTMLResponse
 import uvicorn
 from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.error import RetryAfter
 import gc
 from contextlib import asynccontextmanager
 
@@ -35,8 +36,8 @@ REQUIRED_CHATS: List[str] = [c.strip() for c in REQUIRED_CHATS_RAW.split(",") if
 
 PORT = int(os.environ.get("PORT", 10000))
 DB_POOL_MAX = int(os.environ.get("DB_POOL_MAX", 5))
-MAX_CONCURRENT = int(os.environ.get("MAX_CONCURRENT", 10))  # Reduced for stability
-PROCESSING_SEMAPHORE_TIMEOUT = float(os.environ.get("PROCESSING_SEMAPHORE_TIMEOUT", 5.0))
+MAX_CONCURRENT = 5  # Fixed value - don't use environment variable
+PROCESSING_SEMAPHORE_TIMEOUT = 10.0  # Increased timeout
 
 # ---------------- Globals ----------------
 bot: Optional[Bot] = None
@@ -44,15 +45,19 @@ BOT_ID: Optional[int] = None
 pg_pool: Optional[asyncpg.Pool] = None
 
 # Use smaller deque to save memory
-PROCESSED_UPDATES = deque(maxlen=500)  # Reduced size
+PROCESSED_UPDATES = deque(maxlen=200)  # Further reduced
 admin_state: Dict[int, Dict[str, Any]] = {}
 
-# Use Semaphore with better handling
-PROCESSING_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT)
+# Use BoundedSemaphore to prevent over-release
+PROCESSING_SEMAPHORE = asyncio.BoundedSemaphore(MAX_CONCURRENT)
 
 # Rate limiting
 LAST_REQUEST_TIME = 0
-MIN_REQUEST_INTERVAL = 0.1  # 100ms between requests
+MIN_REQUEST_INTERVAL = 0.2  # Increased to 200ms between requests
+
+# Request tracking for debugging
+ACTIVE_REQUESTS = 0
+REQUEST_HISTORY = deque(maxlen=20)
 
 # ---------------- Memory management ----------------
 def cleanup_memory():
@@ -215,6 +220,7 @@ async def root():
 
 @app.get("/health")
 async def health_check():
+    global ACTIVE_REQUESTS
     db_healthy = await check_db_health()
     bot_healthy = bot is not None
     
@@ -223,9 +229,11 @@ async def health_check():
         "status": "healthy" if status_code == 200 else "unhealthy",
         "database": "connected" if db_healthy else "disconnected",
         "bot": "connected" if bot_healthy else "disconnected",
-        "active_requests": MAX_CONCURRENT - PROCESSING_SEMAPHORE._value,
-        "memory_usage": f"{gc.mem_alloc() / 1024 / 1024:.1f}MB",
-        "processed_updates": len(PROCESSED_UPDATES)
+        "active_requests": ACTIVE_REQUESTS,
+        "max_concurrent": MAX_CONCURRENT,
+        "semaphore_value": PROCESSING_SEMAPHORE._value,
+        "processed_updates": len(PROCESSED_UPDATES),
+        "request_history": list(REQUEST_HISTORY)
     }, status_code=status_code)
 
 @app.get("/ping")
@@ -233,23 +241,29 @@ async def ping():
     return PlainTextResponse("pong")
 
 # ---------------- Safe Telegram API with better error handling ----------------
-async def safe_telegram_call(coro, timeout=10, max_retries=2):
+async def safe_telegram_call(coro, timeout=15, max_retries=2):
     for attempt in range(max_retries + 1):
         try:
             await rate_limit()  # Add rate limiting between Telegram API calls
             return await asyncio.wait_for(coro, timeout=timeout)
+        except RetryAfter as e:
+            if attempt == max_retries:
+                logger.warning("Telegram rate limit exceeded, retry after %s seconds", e.retry_after)
+                raise
+            logger.info("Telegram rate limit, waiting %s seconds", e.retry_after)
+            await asyncio.sleep(e.retry_after)
         except asyncio.TimeoutError:
             if attempt == max_retries:
                 logger.warning("Telegram API timeout after %s seconds (attempt %s)", timeout, attempt + 1)
                 raise
             logger.info("Telegram API timeout, retrying...")
-            await asyncio.sleep(0.5)
+            await asyncio.sleep(1)
         except Exception as e:
             if attempt == max_retries:
                 logger.warning("Telegram API error: %s (attempt %s)", e, attempt + 1)
                 raise
             logger.info("Telegram API error, retrying...")
-            await asyncio.sleep(0.5)
+            await asyncio.sleep(1)
 
 # ---------------- Init schema ----------------
 async def init_db_schema_and_defaults():
@@ -419,6 +433,7 @@ async def process_text_message(msg: dict):
 # ---------------- Webhook handler with improved semaphore handling ----------------
 @app.post("/webhook")
 async def webhook(request: Request):
+    global ACTIVE_REQUESTS
     acquired = False
     start_time = time.time()
     update_id = None
@@ -429,17 +444,27 @@ async def webhook(request: Request):
         if token != WEBHOOK_SECRET_TOKEN:
             raise HTTPException(403, "Invalid token")
 
+    # Track request
+    ACTIVE_REQUESTS += 1
+    REQUEST_HISTORY.append((time.time(), "start"))
+    
     # Acquire semaphore with timeout and better error handling
     try:
         logger.debug(f"Waiting for semaphore. Available: {PROCESSING_SEMAPHORE._value}")
         await asyncio.wait_for(PROCESSING_SEMAPHORE.acquire(), timeout=PROCESSING_SEMAPHORE_TIMEOUT)
         acquired = True
+        ACTIVE_REQUESTS -= 1  # We're now processing, not waiting
         logger.debug(f"Semaphore acquired. Available: {PROCESSING_SEMAPHORE._value}")
+        REQUEST_HISTORY.append((time.time(), "acquired"))
     except asyncio.TimeoutError:
+        ACTIVE_REQUESTS -= 1
         logger.warning("Server busy, rejecting request - semaphore timeout")
+        REQUEST_HISTORY.append((time.time(), "timeout"))
         return JSONResponse({"ok": False, "error": "busy"}, status_code=429)
     except Exception as e:
+        ACTIVE_REQUESTS -= 1
         logger.error(f"Unexpected error acquiring semaphore: {e}")
+        REQUEST_HISTORY.append((time.time(), "error"))
         return JSONResponse({"ok": False, "error": "internal"}, status_code=500)
 
     try:
@@ -582,10 +607,12 @@ async def webhook(request: Request):
 
         processing_time = time.time() - start_time
         logger.info(f"Successfully processed update {update_id} in {processing_time:.2f}s")
+        REQUEST_HISTORY.append((time.time(), "success"))
         return JSONResponse({"ok": True})
 
     except Exception as e:
         logger.error(f"Webhook error for update {update_id}: {e}")
+        REQUEST_HISTORY.append((time.time(), f"error: {str(e)}"))
         return JSONResponse({"ok": False, "error": "internal"}, status_code=500)
         
     finally:
@@ -593,19 +620,15 @@ async def webhook(request: Request):
             try:
                 PROCESSING_SEMAPHORE.release()
                 logger.debug(f"Semaphore released. Available: {PROCESSING_SEMAPHORE._value}")
+                REQUEST_HISTORY.append((time.time(), "released"))
             except ValueError as e:
                 logger.error(f"Error releasing semaphore: {e}")
-                # Reset semaphore if it's in a bad state
-                try:
-                    while PROCESSING_SEMAPHORE._value < MAX_CONCURRENT:
-                        PROCESSING_SEMAPHORE.release()
-                    logger.warning("Semaphore reset to max value")
-                except:
-                    pass
+                REQUEST_HISTORY.append((time.time(), "release_error"))
+                # For BoundedSemaphore, we don't manually reset
 
 # ---------------- Main ----------------
 def main():
-    logger.info("Starting server on port %s", PORT)
+    logger.info("Starting server on port %s with max_concurrent=%s", PORT, MAX_CONCURRENT)
     uvicorn.run(
         app, 
         host="0.0.0.0", 
