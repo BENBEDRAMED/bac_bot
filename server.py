@@ -1,47 +1,47 @@
 import gc
 import time
 import asyncio
-import logging
-from collections import deque
-from contextlib import asynccontextmanager
-from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import JSONResponse, PlainTextResponse, HTMLResponse
-import uvicorn
+    try:
+        update = await request.json()
+        update_id = update.get("update_id")
 
-from settings import PORT, MAX_CONCURRENT, PROCESSING_SEMAPHORE_TIMEOUT, WEBHOOK_SECRET_TOKEN, WEBHOOK_URL, BOT_TOKEN, DATABASE_URL
-from database import init_pg_pool, init_db_schema_and_defaults, check_db_health
-from telegram_client import init_bot, get_bot, get_bot_id
-from handlers import process_text_message, handle_callback_query
-from telegram import Bot
+        logger.info(f"Processing update {update_id}")
 
-logger = logging.getLogger(__name__)
+        if update_id and update_id in PROCESSED_UPDATES:
+            logger.debug(f"Duplicate update {update_id}, skipping")
+            return JSONResponse({"ok": True})
+        PROCESSED_UPDATES.append(update_id)
 
-app = FastAPI(docs_url=None, redoc_url=None)
+        if len(PROCESSED_UPDATES) % 50 == 0:
+            cleanup_memory()
 
-PROCESSED_UPDATES = deque(maxlen=200)
-PROCESSING_SEMAPHORE = asyncio.BoundedSemaphore(MAX_CONCURRENT)
-ACTIVE_REQUESTS = 0
-REQUEST_HISTORY = deque(maxlen=20)
+        if "callback_query" in update:
+            await handle_callback_query(update["callback_query"])
 
-# Heartbeat imports
-import threading
-import sys
+        elif "message" in update:
+            await process_text_message(update["message"])
+        elif "edited_message" in update:
+            await process_text_message(update["edited_message"])
 
-def cleanup_memory():
-    gc.collect()
+        processing_time = time.time() - start_time
+        logger.info(f"Successfully processed update {update_id} in {processing_time:.2f}s")
+        REQUEST_HISTORY.append((time.time(), "success"))
+        return JSONResponse({"ok": True})
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    logger.info("Starting up...")
-    
-    if not BOT_TOKEN or not DATABASE_URL:
-        logger.error("Missing required environment variables")
-        yield
-        return
+    except Exception as e:
+        logger.error(f"Webhook error for update {update_id}: {e}")
+        REQUEST_HISTORY.append((time.time(), f"error: {str(e)}"))
+        return JSONResponse({"ok": False, "error": "internal"}, status_code=500)
 
-# Heartbeat logger
-def heartbeat():
-    while True:
+    finally:
+        if acquired:
+            try:
+                PROCESSING_SEMAPHORE.release()
+                logger.debug(f"Semaphore released. Available: {PROCESSING_SEMAPHORE._value}")
+                REQUEST_HISTORY.append((time.time(), "released"))
+            except ValueError as e:
+                logger.error(f"Error releasing semaphore: {e}")
+                REQUEST_HISTORY.append((time.time(), "release_error"))
         logger.info("[HEARTBEAT] Bot process alive")
         time.sleep(30)
 
