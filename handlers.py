@@ -45,14 +45,20 @@ async def process_text_message(msg: dict):
     from_user = msg.get("from", {})
     user_id = from_user.get("id")
 
+    # Basic validation
     if not text or not chat_id or not user_id or not bot:
+        logger.debug("Missing text/chat/user/bot - ignoring message")
         return
+
+    text = text.strip()
+    logger.debug(f"Received text from {user_id}: {text}")
 
     # Ignore bot messages including the bot itself
-    if from_user.get("is_bot") or (BOT_ID and from_user.get("id") == BOT_ID):
+    if from_user.get("is_bot") or (BOT_ID and user_id == BOT_ID):
+        logger.debug("Ignoring message from a bot or from the bot itself")
         return
 
-    # Handle button presses from ReplyKeyboard
+    # ------- Immediate reply-keyboard buttons -------
     if text == "لقد انضممت — تحقق":
         ok, missing, _ = await check_user_membership(user_id)
         if ok:
@@ -72,7 +78,7 @@ async def process_text_message(msg: dict):
             ))
         return
 
-    elif text == "العودة":
+    if text == "العودة":
         user_current_menu[user_id] = 0
         markup = await build_main_menu()
         if markup:
@@ -83,7 +89,8 @@ async def process_text_message(msg: dict):
             ))
         return
 
-    # Admin flows
+    # ------- Admin quick commands (only for admins) -------
+    # These are admin textual commands that should be processed before menu lookups
     if user_id in ADMIN_IDS:
         if text == "إضافة زر جديد":
             admin_state[user_id] = {"action": "awaiting_add"}
@@ -93,7 +100,7 @@ async def process_text_message(msg: dict):
                 reply_markup=ReplyKeyboardRemove()
             ))
             return
-        elif text == "حذف زر":
+        if text == "حذف زر":
             admin_state[user_id] = {"action": "awaiting_remove"}
             await safe_telegram_call(bot.send_message(
                 chat_id=chat_id,
@@ -101,7 +108,7 @@ async def process_text_message(msg: dict):
                 reply_markup=ReplyKeyboardRemove()
             ))
             return
-        elif text == "عرض جميع الأزرار":
+        if text == "عرض جميع الأزرار":
             try:
                 rows = await db_fetchall("SELECT id, name, callback_data FROM buttons ORDER BY id")
                 text_msg = "\n".join(f"{r['id']}: {r['name']} ({r['callback_data']})" for r in rows)
@@ -113,7 +120,7 @@ async def process_text_message(msg: dict):
             except Exception as e:
                 logger.error("Failed to list buttons: %s", e)
             return
-        elif text == "رفع ملف لزر موجود":
+        if text == "رفع ملف لزر موجود":
             await safe_telegram_call(bot.send_message(
                 chat_id=chat_id,
                 text="هذه الميزة غير متاحة بعد",
@@ -121,7 +128,7 @@ async def process_text_message(msg: dict):
             ))
             return
 
-    # Admin text processing
+    # ------- Admin interactive state (awaiting text inputs) -------
     if user_id in admin_state:
         state = admin_state[user_id]
         action = state.get("action")
@@ -147,7 +154,7 @@ async def process_text_message(msg: dict):
                 await safe_telegram_call(bot.send_message(chat_id=chat_id, text="خطأ في الإضافة"))
             return
 
-        elif action == "awaiting_remove":
+        if action == "awaiting_remove":
             try:
                 bid = int(text.strip())
                 await db_execute("DELETE FROM buttons WHERE id = $1", bid)
@@ -163,8 +170,8 @@ async def process_text_message(msg: dict):
                 await safe_telegram_call(bot.send_message(chat_id=chat_id, text="خطأ في الحذف"))
             return
 
-    # Start command
-    if text.strip().lower().startswith("/start"):
+    # ------- /start command -------
+    if text.lower().startswith("/start"):
         ok, missing, reasons = await check_user_membership(user_id)
         if not ok:
             message = "✋ يلزم الانضمام إلى:\n" + "\n".join(f"- {c}" for c in missing) + "\n\nاضغط 'لقد انضممت — تحقق'"
@@ -180,7 +187,7 @@ async def process_text_message(msg: dict):
             await db_execute("INSERT INTO users (user_id, first_name) VALUES ($1,$2) ON CONFLICT DO NOTHING", 
                            user_id, from_user.get("first_name", ""))
         except Exception:
-            pass
+            logger.exception("Failed to insert user (non-fatal)")
 
         user_current_menu[user_id] = 0
         markup = await build_main_menu()
@@ -190,64 +197,93 @@ async def process_text_message(msg: dict):
                 text="مرحباً! اختر القسم:", 
                 reply_markup=markup
             ))
+        return
 
-    # Handle regular menu button presses
-    else:
-        # Check if this text matches a button name
-        button = await db_fetchone("SELECT id, content_type, file_id, parent_id FROM buttons WHERE name = $1", text)
-        if button:
-            # If button has content, send it
-            if button["content_type"] and button["file_id"]:
-                ctype, fid = button["content_type"], button["file_id"]
-                if ctype == "document":
-                    await safe_telegram_call(bot.send_document(chat_id=chat_id, document=fid))
-                elif ctype == "photo":
-                    await safe_telegram_call(bot.send_photo(chat_id=chat_id, photo=fid))
-                elif ctype == "video":
-                    await safe_telegram_call(bot.send_video(chat_id=chat_id, video=fid))
-                else:
-                    await safe_telegram_call(bot.send_message(chat_id=chat_id, text=str(fid)))
-                
-                # Show appropriate menu after content
-                if button["parent_id"] == 0:
-                    markup = await build_main_menu()
-                    if markup:
-                        await safe_telegram_call(bot.send_message(
-                            chat_id=chat_id,
-                            text="اختر القسم التالي:",
-                            reply_markup=markup
-                        ))
-                else:
-                    markup = await build_compact_submenu(button["parent_id"])
-                    if markup:
-                        parent_button = await db_fetchone("SELECT name FROM buttons WHERE id = $1", button["parent_id"])
-                        parent_name = parent_button["name"] if parent_button else "القسم"
-                        await safe_telegram_call(bot.send_message(
-                            chat_id=chat_id,
-                            text=f"اختر من {parent_name}:",
-                            reply_markup=markup
-                        ))
+    # ------- Admin panel access must be checked BEFORE DB lookup -------
+    if text == "الإدارة" and user_id in ADMIN_IDS:
+        logger.debug("Admin panel requested")
+        await safe_telegram_call(bot.send_message(
+            chat_id=chat_id,
+            text="لوحة التحكم:",
+            reply_markup=admin_panel_markup()
+        ))
+        return
+
+    # ------- Database-driven menu/button handling -------
+    try:
+        button = await db_fetchone(
+            "SELECT id, content_type, file_id, parent_id FROM buttons WHERE name = $1",
+            text
+        )
+    except Exception as e:
+        logger.error("DB lookup failed for button '%s': %s", text, e)
+        button = None
+
+    if button:
+        # If button has content, send it
+        if button.get("content_type") and button.get("file_id"):
+            ctype, fid = button["content_type"], button["file_id"]
+            if ctype == "document":
+                await safe_telegram_call(bot.send_document(chat_id=chat_id, document=fid))
+            elif ctype == "photo":
+                await safe_telegram_call(bot.send_photo(chat_id=chat_id, photo=fid))
+            elif ctype == "video":
+                await safe_telegram_call(bot.send_video(chat_id=chat_id, video=fid))
             else:
-                # This is a menu button - show its submenu
-                user_current_menu[user_id] = button["id"]
-                markup = await build_compact_submenu(button["id"])
+                await safe_telegram_call(bot.send_message(chat_id=chat_id, text=str(fid)))
+            
+            # Show appropriate menu after content
+            if button.get("parent_id") == 0:
+                markup = await build_main_menu()
                 if markup:
                     await safe_telegram_call(bot.send_message(
                         chat_id=chat_id,
-                        text=f"اختر من {text}:",
+                        text="اختر القسم التالي:",
                         reply_markup=markup
                     ))
-                else:
+            else:
+                markup = await build_compact_submenu(button["parent_id"])
+                if markup:
+                    parent_button = await db_fetchone("SELECT name FROM buttons WHERE id = $1", button["parent_id"])
+                    parent_name = parent_button["name"] if parent_button else "القسم"
                     await safe_telegram_call(bot.send_message(
                         chat_id=chat_id,
-                        text="لا محتوى متاح حالياً",
-                        reply_markup=await build_main_menu()
+                        text=f"اختر من {parent_name}:",
+                        reply_markup=markup
                     ))
+            return
 
-        # Check if it's an admin panel access
-        elif text == "الإدارة" and user_id in ADMIN_IDS:
+        # This is a menu button - show its submenu
+        user_current_menu[user_id] = button["id"]
+        markup = await build_compact_submenu(button["id"])
+        if markup:
             await safe_telegram_call(bot.send_message(
                 chat_id=chat_id,
-                text="لوحة التحكم:",
-                reply_markup=admin_panel_markup()
+                text=f"اختر من {text}:",
+                reply_markup=markup
             ))
+            return
+        else:
+            # No submenu and no content
+            await safe_telegram_call(bot.send_message(
+                chat_id=chat_id,
+                text="لا محتوى متاح حالياً",
+                reply_markup=await build_main_menu()
+            ))
+            return
+
+    # ------- Fallback (unrecognized text) -------
+    logger.debug("Unrecognized text; sending main menu if available")
+    main_markup = await build_main_menu()
+    if main_markup:
+        await safe_telegram_call(bot.send_message(
+            chat_id=chat_id,
+            text="اختر القسم:",
+            reply_markup=main_markup
+        ))
+    else:
+        # last resort fallback
+        await safe_telegram_call(bot.send_message(
+            chat_id=chat_id,
+            text="عذراً، لم أفهم الرسالة."
+        ))
