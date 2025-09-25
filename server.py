@@ -26,43 +26,39 @@ PROCESSING_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT)
 # ---- Webhook route ----
 @app.post("/webhook")
 async def webhook(request: Request):
-    start_time = time.time()
-    acquired = await PROCESSING_SEMAPHORE.acquire()
     update_id = None
+    await PROCESSING_SEMAPHORE.acquire()
     try:
         update = await request.json()
         update_id = update.get("update_id")
-
         logger.info(f"Processing update {update_id}")
 
         if update_id and update_id in PROCESSED_UPDATES:
             logger.debug(f"Duplicate update {update_id}, skipping")
-            return JSONResponse({"ok": True})
+            return {"ok": True}
         PROCESSED_UPDATES.append(update_id)
 
-        if len(PROCESSED_UPDATES) % 50 == 0:
-            gc.collect()
-
-        # Remove callback query handling - only process messages
         if "message" in update:
-            await process_text_message(update["message"])
-        elif "edited_message" in update:
-            await process_text_message(update["edited_message"])
+            try:
+                await process_text_message(update["message"])
+            except Exception as e:
+                logger.error(f"process_text_message failed: {e}")
 
-        processing_time = time.time() - start_time
-        logger.info(f"Processed update {update_id} in {processing_time:.2f}s")
-        REQUEST_HISTORY.append((time.time(), "success"))
-        return JSONResponse({"ok": True})
+        elif "edited_message" in update:
+            try:
+                await process_text_message(update["edited_message"])
+            except Exception as e:
+                logger.error(f"process_text_message failed: {e}")
+
+        return {"ok": True}
 
     except Exception as e:
-        logger.error(f"Webhook error for update {update_id}: {e}")
-        REQUEST_HISTORY.append((time.time(), f"error: {str(e)}"))
-        return JSONResponse({"ok": False, "error": "internal"}, status_code=500)
+        logger.error(f"Webhook handler error: {e}")
+        # Always return 200 so Telegram doesn't retry with flood
+        return {"ok": True}
 
     finally:
-        if acquired:
-            PROCESSING_SEMAPHORE.release()
-            logger.debug(f"Semaphore released. Available: {PROCESSING_SEMAPHORE._value}")
+        PROCESSING_SEMAPHORE.release()
 
 
 # ---- Lifespan ----
