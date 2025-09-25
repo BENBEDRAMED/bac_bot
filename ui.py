@@ -1,65 +1,66 @@
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import KeyboardButton, ReplyKeyboardMarkup
 from database import db_fetchall
 import logging
 
 logger = logging.getLogger(__name__)
 
-def rows_to_markup(rows, buttons_per_row=2, back_button=True):
-    if not rows:
+def create_reply_markup(button_rows, resize_keyboard=True, one_time_keyboard=False):
+    """Create a ReplyKeyboardMarkup with the given button rows"""
+    if not button_rows:
         return None
     
-    # Create compact keyboard with multiple buttons per row
+    # Create keyboard with KeyboardButton instead of InlineKeyboardButton
     keyboard = []
-    row = []
+    for row in button_rows:
+        keyboard_row = []
+        for button in row:
+            keyboard_row.append(KeyboardButton(button["text"]))
+        keyboard.append(keyboard_row)
     
-    for i, r in enumerate(rows):
-        row.append(InlineKeyboardButton(r["name"], callback_data=r["callback_data"]))
-        if len(row) == buttons_per_row or i == len(rows) - 1:
-            keyboard.append(row)
-            row = []
-    
-    # Add back button at the bottom
-    if back_button:
-        keyboard.append([InlineKeyboardButton("العودة", callback_data="back_to_main")])
-    
-    return InlineKeyboardMarkup(keyboard)
+    return ReplyKeyboardMarkup(
+        keyboard, 
+        resize_keyboard=resize_keyboard,
+        one_time_keyboard=one_time_keyboard,
+        selective=False
+    )
 
 async def build_main_menu():
     try:
         rows = await db_fetchall("SELECT name, callback_data FROM buttons WHERE parent_id = 0 ORDER BY id")
-        # For main menu, use 2 buttons per row, no back button
         if not rows:
             return None
         
-        keyboard = []
-        row = []
+        # Convert to ReplyKeyboardMarkup format
+        keyboard_rows = []
+        current_row = []
         
         for i, r in enumerate(rows):
-            row.append(InlineKeyboardButton(r["name"], callback_data=r["callback_data"]))
-            if len(row) == 2 or i == len(rows) - 1:  # 2 buttons per row
-                keyboard.append(row)
-                row = []
+            current_row.append({"text": r["name"]})
+            if len(current_row) == 2 or i == len(rows) - 1:  # 2 buttons per row
+                keyboard_rows.append(current_row)
+                current_row = []
         
-        return InlineKeyboardMarkup(keyboard)
+        return create_reply_markup(keyboard_rows, resize_keyboard=True)
     except Exception as e:
         logger.error("Failed to build main menu: %s", e)
         return None
 
 def admin_panel_markup():
-    # Compact admin panel with 2 buttons per row
-    keyboard = [
-        [InlineKeyboardButton("إضافة زر جديد", callback_data="admin_add_button")],
-        [InlineKeyboardButton("حذف زر", callback_data="admin_remove_button")],
-        [InlineKeyboardButton("رفع ملف لزر موجود", callback_data="admin_upload_to_button")],
-        [InlineKeyboardButton("عرض جميع الأزرار", callback_data="admin_list_buttons")],
-        [InlineKeyboardButton("العودة", callback_data="back_to_main")],
+    # Admin panel as ReplyKeyboardMarkup
+    keyboard_rows = [
+        [{"text": "إضافة زر جديد"}],
+        [{"text": "حذف زر"}],
+        [{"text": "رفع ملف لزر موجود"}],
+        [{"text": "عرض جميع الأزرار"}],
+        [{"text": "العودة"}],
     ]
-    return InlineKeyboardMarkup(keyboard)
+    return create_reply_markup(keyboard_rows, resize_keyboard=True)
 
 def missing_chats_markup():
-    return InlineKeyboardMarkup([[InlineKeyboardButton("لقد انضممت — تحقق", callback_data="check_membership")]])
+    # Single button for membership check
+    keyboard_rows = [[{"text": "لقد انضممت — تحقق"}]]
+    return create_reply_markup(keyboard_rows, resize_keyboard=True)
 
-# New function for compact submenu layout
 async def build_compact_submenu(parent_id, buttons_per_row=2):
     try:
         subs = await db_fetchall(
@@ -69,7 +70,33 @@ async def build_compact_submenu(parent_id, buttons_per_row=2):
         if not subs:
             return None
             
-        return rows_to_markup(subs, buttons_per_row=buttons_per_row, back_button=True)
+        # Convert to ReplyKeyboardMarkup format
+        keyboard_rows = []
+        current_row = []
+        
+        for i, r in enumerate(subs):
+            current_row.append({"text": r["name"]})
+            if len(current_row) == buttons_per_row or i == len(subs) - 1:
+                keyboard_rows.append(current_row)
+                current_row = []
+        
+        # Add back button
+        keyboard_rows.append([{"text": "العودة"}])
+        
+        return create_reply_markup(keyboard_rows, resize_keyboard=True)
     except Exception as e:
         logger.error("Failed to build submenu: %s", e)
         return None
+
+# Helper function to create simple keyboard
+def create_simple_keyboard(button_texts, buttons_per_row=2):
+    keyboard_rows = []
+    current_row = []
+    
+    for i, text in enumerate(button_texts):
+        current_row.append({"text": text})
+        if len(current_row) == buttons_per_row or i == len(button_texts) - 1:
+            keyboard_rows.append(current_row)
+            current_row = []
+    
+    return create_reply_markup(keyboard_rows, resize_keyboard=True)

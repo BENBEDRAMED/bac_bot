@@ -10,8 +10,9 @@ from contextlib import asynccontextmanager
 from database import init_pg_pool, init_db_schema_and_defaults, check_db_health, pg_pool
 from telegram_client import init_bot, get_bot
 from settings import BOT_TOKEN, DATABASE_URL, WEBHOOK_URL, WEBHOOK_SECRET_TOKEN, MAX_CONCURRENT
-from handlers import handle_callback_query, process_text_message
+from handlers import process_text_message  # Remove handle_callback_query import
 import logging
+
 logger = logging.getLogger(__name__)
 
 app = FastAPI()
@@ -42,9 +43,8 @@ async def webhook(request: Request):
         if len(PROCESSED_UPDATES) % 50 == 0:
             gc.collect()
 
-        if "callback_query" in update:
-            await handle_callback_query(update["callback_query"])
-        elif "message" in update:
+        # Remove callback query handling - only process messages
+        if "message" in update:
             await process_text_message(update["message"])
         elif "edited_message" in update:
             await process_text_message(update["edited_message"])
