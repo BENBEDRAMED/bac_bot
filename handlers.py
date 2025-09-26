@@ -221,13 +221,13 @@ async def process_update(msg: dict):
                 await db_execute("UPDATE media_files SET name = $1 WHERE id = $2", text.strip(), last_media_id)
                 # go back to upload mode so admin can add more files
                 admin_state[user_id] = {"action": "awaiting_upload", "target_button": st.get("target_button")}
-                await safe_telegram_call(bot.send_message(chat_id=chat_id, text=f\"تم حفظ الاسم: {text.strip()}. أرسل ملف آخر أو اكتب 'انتهيت' لإنهاء.\", reply_markup=admin_panel_markup()))
+                await safe_telegram_call(bot.send_message(chat_id=chat_id, text=f"تم حفظ الاسم: {text.strip()}. أرسل ملف آخر أو اكتب 'انتهيت' لإنهاء.", reply_markup=admin_panel_markup()))
             except Exception as e:
-                logger.exception(\"Failed to update media_files.name: %s\", e)
-                await safe_telegram_call(bot.send_message(chat_id=chat_id, text=\"فشل حفظ الاسم.\"))
+                logger.exception("Failed to update media_files.name: %s", e)
+                await safe_telegram_call(bot.send_message(chat_id=chat_id, text="فشل حفظ الاسم."))
 
         else:
-            await safe_telegram_call(bot.send_message(chat_id=chat_id, text=\"أرسل اسم المحتوى كنص أو اكتب 'تخطى' لتركه فارغاً.\"))
+            await safe_telegram_call(bot.send_message(chat_id=chat_id, text="أرسل اسم المحتوى كنص أو اكتب 'تخطى' لتركه فارغاً."))
         return
 
     # If admin typed 'انتهيت' while in upload mode -> finish
@@ -398,12 +398,10 @@ async def process_update(msg: dict):
                     bid = int(bid_str.strip())
                     cname = content_name.strip()
                     # Delete the specified named content for the given button
-                    res = await db_execute("DELETE FROM media_files WHERE button_id = $1 AND name = $2", bid, cname)
-                    # db_execute returns status like 'DELETE 1' or similar; we can confirm existence by checking rows.
-                    # To be explicit, try to fetch after delete to verify 0 rows left with that name:
+                    await db_execute("DELETE FROM media_files WHERE button_id = $1 AND name = $2", bid, cname)
+                    # Confirm deletion
                     remaining = await db_fetchall("SELECT id FROM media_files WHERE button_id = $1 AND name = $2", bid, cname)
                     if remaining:
-                        # something unusual: still present
                         await safe_telegram_call(bot.send_message(chat_id=chat_id, text="حدث خطأ — لم يتم حذف المحتوى بالكامل. تفقد القاعدة."))
                     else:
                         await safe_telegram_call(bot.send_message(chat_id=chat_id, text=f"تم حذف المحتوى '{cname}' من الزر id={bid}.", reply_markup=admin_panel_markup()))
