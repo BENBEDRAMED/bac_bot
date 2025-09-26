@@ -19,7 +19,7 @@ user_current_menu: Dict[int, int] = {}  # Track user's current menu level
 
 def chunk_list(lst, n):
     for i in range(0, len(lst), n):
-        yield lst[i:i+n]
+        yield lst[i:i + n]
 
 
 async def send_files_for_button(bot, chat_id: int, files: Sequence[dict]):
@@ -52,12 +52,30 @@ async def send_files_for_button(bot, chat_id: int, files: Sequence[dict]):
                 item = group[0]
                 try:
                     if item["content_type"] == "photo":
-                        await safe_telegram_call(bot.send_photo(chat_id=chat_id, photo=item["file_id"], caption=item.get("caption") or ""))
+                        await safe_telegram_call(
+                            bot.send_photo(
+                                chat_id=chat_id,
+                                photo=item["file_id"],
+                                caption=item.get("caption") or ""
+                            )
+                        )
                     else:
-                        await safe_telegram_call(bot.send_video(chat_id=chat_id, video=item["file_id"], caption=item.get("caption") or ""))
+                        await safe_telegram_call(
+                            bot.send_video(
+                                chat_id=chat_id,
+                                video=item["file_id"],
+                                caption=item.get("caption") or ""
+                            )
+                        )
                 except Exception:
                     logger.exception("Failed to send single media item, falling back to send_document")
-                    await safe_telegram_call(bot.send_document(chat_id=chat_id, document=item["file_id"], caption=item.get("caption") or ""))
+                    await safe_telegram_call(
+                        bot.send_document(
+                            chat_id=chat_id,
+                            document=item["file_id"],
+                            caption=item.get("caption") or ""
+                        )
+                    )
             else:
                 media = []
                 first = True
@@ -78,9 +96,21 @@ async def send_files_for_button(bot, chat_id: int, files: Sequence[dict]):
                     for it in group:
                         try:
                             if it["content_type"] == "photo":
-                                await safe_telegram_call(bot.send_photo(chat_id=chat_id, photo=it["file_id"], caption=it.get("caption") or ""))
+                                await safe_telegram_call(
+                                    bot.send_photo(
+                                        chat_id=chat_id,
+                                        photo=it["file_id"],
+                                        caption=it.get("caption") or ""
+                                    )
+                                )
                             else:
-                                await safe_telegram_call(bot.send_video(chat_id=chat_id, video=it["file_id"], caption=it.get("caption") or ""))
+                                await safe_telegram_call(
+                                    bot.send_video(
+                                        chat_id=chat_id,
+                                        video=it["file_id"],
+                                        caption=it.get("caption") or ""
+                                    )
+                                )
                         except Exception:
                             logger.exception("Fallback single send failed for media item")
 
@@ -90,14 +120,38 @@ async def send_files_for_button(bot, chat_id: int, files: Sequence[dict]):
         # Non-groupable types
         try:
             if ctype == "document":
-                await safe_telegram_call(bot.send_document(chat_id=chat_id, document=f["file_id"], caption=f.get("caption") or ""))
+                await safe_telegram_call(
+                    bot.send_document(
+                        chat_id=chat_id,
+                        document=f["file_id"],
+                        caption=f.get("caption") or ""
+                    )
+                )
             elif ctype == "audio":
-                await safe_telegram_call(bot.send_audio(chat_id=chat_id, audio=f["file_id"], caption=f.get("caption") or ""))
+                await safe_telegram_call(
+                    bot.send_audio(
+                        chat_id=chat_id,
+                        audio=f["file_id"],
+                        caption=f.get("caption") or ""
+                    )
+                )
             elif ctype == "voice":
-                await safe_telegram_call(bot.send_voice(chat_id=chat_id, voice=f["file_id"], caption=f.get("caption") or ""))
+                await safe_telegram_call(
+                    bot.send_voice(
+                        chat_id=chat_id,
+                        voice=f["file_id"],
+                        caption=f.get("caption") or ""
+                    )
+                )
             else:
                 # Generic fallback
-                await safe_telegram_call(bot.send_document(chat_id=chat_id, document=f["file_id"], caption=f.get("caption") or ""))
+                await safe_telegram_call(
+                    bot.send_document(
+                        chat_id=chat_id,
+                        document=f["file_id"],
+                        caption=f.get("caption") or ""
+                    )
+                )
         except Exception:
             logger.exception("Failed to send non-groupable file, skipping")
 
@@ -144,9 +198,10 @@ async def process_update(msg: dict):
     """
     Handle incoming Telegram message update. Accepts both text and media.
 
-    New features:
-      - Admins can upload a file and then give it a name (title).
-      - Admins can delete a content item by sending: زر_ID|اسم_المحتوى after choosing 'حذف محتوى'.
+    Features:
+      - Caption (if present) is used as the content name when uploading.
+      - Admins can upload multiple files to a button.
+      - Admins can delete content by: زر_ID|اسم_المحتوى after choosing 'حذف محتوى'.
     """
     bot = get_bot()
     BOT_ID = get_bot_id()
@@ -175,83 +230,120 @@ async def process_update(msg: dict):
         logger.debug("Ignoring message from a bot or from the bot itself")
         return
 
- # -------- Admin: handle file upload -> caption used as name if present --------
-file_info = extract_file_from_message(msg)
-if file_info and user_id in admin_state and admin_state[user_id].get("action") == "awaiting_upload":
-    state = admin_state[user_id]
-    target_button = state.get("target_button")
-    if not target_button:
-        await safe_telegram_call(bot.send_message(chat_id=chat_id, text="لم يتم تحديد زر الهدف. أرسل ID الزر أولاً."))
+    # -------- Admin: handle file upload -> caption used as name if present --------
+    file_info = extract_file_from_message(msg)
+    if file_info and user_id in admin_state and admin_state[user_id].get("action") == "awaiting_upload":
+        state = admin_state[user_id]
+        target_button = state.get("target_button")
+        if not target_button:
+            await safe_telegram_call(
+                bot.send_message(
+                    chat_id=chat_id,
+                    text="لم يتم تحديد زر الهدف. أرسل ID الزر أولاً."
+                )
+            )
+            return
+
+        # Use caption as name if provided and non-empty
+        caption_text = (file_info.get("caption") or "").strip()
+        provided_name = caption_text if caption_text else None
+
+        try:
+            row = await db_fetchone(
+                "INSERT INTO media_files (button_id, file_id, content_type, caption, sort_order, name) VALUES ($1,$2,$3,$4,$5,$6) RETURNING id",
+                target_button, file_info["file_id"], file_info["content_type"], file_info.get("caption"), 0, provided_name
+            )
+            new_id = row["id"] if row else None
+
+            if provided_name:
+                # No need to ask for name; stored from caption
+                admin_state[user_id] = {"action": "awaiting_upload", "target_button": target_button}
+                shown = provided_name[:200]
+                await safe_telegram_call(
+                    bot.send_message(
+                        chat_id=chat_id,
+                        text=f"تم رفع الملف وحفظ الاسم من الـ caption: {shown}\nأرسل ملف آخر أو اكتب 'انتهيت' لإنهاء.",
+                        reply_markup=admin_panel_markup()
+                    )
+                )
+            else:
+                # Ask admin for name (existing flow)
+                admin_state[user_id] = {
+                    "action": "awaiting_name",
+                    "target_button": target_button,
+                    "last_media_id": new_id
+                }
+                await safe_telegram_call(
+                    bot.send_message(
+                        chat_id=chat_id,
+                        text="تم رفع الملف. أرسل اسم المحتوى لهذا الملف الآن (أو اكتب 'تخطى' لترك الاسم فارغاً).",
+                        reply_markup=admin_panel_markup()
+                    )
+                )
+        except Exception as e:
+            logger.exception("Failed to insert media file: %s", e)
+            await safe_telegram_call(
+                bot.send_message(
+                    chat_id=chat_id,
+                    text="فشل رفع الملف."
+                )
+            )
         return
-
-    # Use caption as name if provided and non-empty
-    caption = (file_info.get("caption") or "").strip()
-    provided_name = caption if caption else None
-
-    try:
-        # Insert row; if provided_name is set, store it directly in name column
-        row = await db_fetchone(
-            "INSERT INTO media_files (button_id, file_id, content_type, caption, sort_order, name) "
-            "VALUES ($1,$2,$3,$4,$5,$6) RETURNING id",
-            target_button,
-            file_info["file_id"],
-            file_info["content_type"],
-            file_info.get("caption"),
-            0,
-            provided_name
-        )
-        new_id = row["id"] if row else None
-
-        if provided_name:
-            # Caption used as name — go back to upload mode (no naming step)
-            admin_state[user_id] = {"action": "awaiting_upload", "target_button": target_button}
-            # truncate shown name for safety in message (200 chars)
-            shown = provided_name[:200]
-            await safe_telegram_call(bot.send_message(chat_id=chat_id, text=f"تم رفع الملف وحفظ الاسم من الـ caption: {shown}\nأرسل ملف آخر أو اكتب 'انتهيت' لإنهاء.", reply_markup=admin_panel_markup()))
-        else:
-            # No caption -> ask admin for name (existing flow)
-            admin_state[user_id] = {
-                "action": "awaiting_name",
-                "target_button": target_button,
-                "last_media_id": new_id
-            }
-            await safe_telegram_call(bot.send_message(chat_id=chat_id, text="تم رفع الملف. أرسل اسم المحتوى لهذا الملف الآن (أو اكتب 'تخطى' لترك الاسم فارغاً).", reply_markup=admin_panel_markup()))
-    except Exception as e:
-        logger.exception("Failed to insert media file: %s", e)
-        await safe_telegram_call(bot.send_message(chat_id=chat_id, text="فشل رفع الملف."))
-    return
 
     # -------- Admin: handle naming the last uploaded file --------
     if user_id in admin_state and admin_state[user_id].get("action") == "awaiting_name":
-        # Expecting a text name for the last uploaded media
         if text:
             st = admin_state[user_id]
             last_media_id = st.get("last_media_id")
             if text.strip().lower() == "تخطى":
-                # leave name null/empty and return to upload mode
                 await db_execute("UPDATE media_files SET name = NULL WHERE id = $1", last_media_id)
                 admin_state[user_id] = {"action": "awaiting_upload", "target_button": st.get("target_button")}
-                await safe_telegram_call(bot.send_message(chat_id=chat_id, text="تم حفظ الملف بدون اسم. أرسل ملف آخر أو اكتب 'انتهيت' لإنهاء.", reply_markup=admin_panel_markup()))
+                await safe_telegram_call(
+                    bot.send_message(
+                        chat_id=chat_id,
+                        text="تم حفظ الملف بدون اسم. أرسل ملف آخر أو اكتب 'انتهيت' لإنهاء.",
+                        reply_markup=admin_panel_markup()
+                    )
+                )
                 return
 
             try:
-                # Save the provided name
                 await db_execute("UPDATE media_files SET name = $1 WHERE id = $2", text.strip(), last_media_id)
-                # go back to upload mode so admin can add more files
                 admin_state[user_id] = {"action": "awaiting_upload", "target_button": st.get("target_button")}
-                await safe_telegram_call(bot.send_message(chat_id=chat_id, text=f"تم حفظ الاسم: {text.strip()}. أرسل ملف آخر أو اكتب 'انتهيت' لإنهاء.", reply_markup=admin_panel_markup()))
+                await safe_telegram_call(
+                    bot.send_message(
+                        chat_id=chat_id,
+                        text=f"تم حفظ الاسم: {text.strip()}. أرسل ملف آخر أو اكتب 'انتهيت' لإنهاء.",
+                        reply_markup=admin_panel_markup()
+                    )
+                )
             except Exception as e:
                 logger.exception("Failed to update media_files.name: %s", e)
-                await safe_telegram_call(bot.send_message(chat_id=chat_id, text="فشل حفظ الاسم."))
-
+                await safe_telegram_call(
+                    bot.send_message(
+                        chat_id=chat_id,
+                        text="فشل حفظ الاسم."
+                    )
+                )
         else:
-            await safe_telegram_call(bot.send_message(chat_id=chat_id, text="أرسل اسم المحتوى كنص أو اكتب 'تخطى' لتركه فارغاً."))
+            await safe_telegram_call(
+                bot.send_message(
+                    chat_id=chat_id,
+                    text="أرسل اسم المحتوى كنص أو اكتب 'تخطى' لتركه فارغاً."
+                )
+            )
         return
 
     # If admin typed 'انتهيت' while in upload mode -> finish
     if text == "انتهيت" and user_id in admin_state and admin_state[user_id].get("action") in ("awaiting_upload", "awaiting_name"):
         admin_state.pop(user_id, None)
-        await safe_telegram_call(bot.send_message(chat_id=chat_id, text="انتهى الرفع.", reply_markup=admin_panel_markup()))
+        await safe_telegram_call(
+            bot.send_message(
+                chat_id=chat_id,
+                text="انتهى الرفع.",
+                reply_markup=admin_panel_markup()
+            )
+        )
         return
 
     # ------- Immediate reply-keyboard buttons -------
@@ -262,28 +354,34 @@ if file_info and user_id in admin_state and admin_state[user_id].get("action") =
                 user_current_menu[user_id] = 0
                 markup = await build_main_menu()
                 if markup:
-                    await safe_telegram_call(bot.send_message(
-                        chat_id=chat_id,
-                        text="تم التحقق — اختر القسم:",
-                        reply_markup=markup
-                    ))
+                    await safe_telegram_call(
+                        bot.send_message(
+                            chat_id=chat_id,
+                            text="تم التحقق — اختر القسم:",
+                            reply_markup=markup
+                        )
+                    )
             else:
-                await safe_telegram_call(bot.send_message(
-                    chat_id=chat_id,
-                    text="لا زلت تحتاج للانضمام",
-                    reply_markup=missing_chats_markup()
-                ))
+                await safe_telegram_call(
+                    bot.send_message(
+                        chat_id=chat_id,
+                        text="لا زلت تحتاج للانضمام",
+                        reply_markup=missing_chats_markup()
+                    )
+                )
             return
 
         if text == "العودة":
             user_current_menu[user_id] = 0
             markup = await build_main_menu()
             if markup:
-                await safe_telegram_call(bot.send_message(
-                    chat_id=chat_id,
-                    text="اختر القسم:",
-                    reply_markup=markup
-                ))
+                await safe_telegram_call(
+                    bot.send_message(
+                        chat_id=chat_id,
+                        text="اختر القسم:",
+                        reply_markup=markup
+                    )
+                )
             return
     except Exception as e:
         logger.exception("Error handling immediate reply-keyboard buttons: %s", e)
@@ -293,51 +391,61 @@ if file_info and user_id in admin_state and admin_state[user_id].get("action") =
         if user_id in ADMIN_IDS:
             if text == "إضافة زر جديد":
                 admin_state[user_id] = {"action": "awaiting_add"}
-                await safe_telegram_call(bot.send_message(
-                    chat_id=chat_id,
-                    text="أرسل البيانات المطلوبة بالشكل: اسم الزر|الأب_ID",
-                    reply_markup=ReplyKeyboardRemove()
-                ))
+                await safe_telegram_call(
+                    bot.send_message(
+                        chat_id=chat_id,
+                        text="أرسل البيانات المطلوبة بالشكل: اسم الزر|الأب_ID",
+                        reply_markup=ReplyKeyboardRemove()
+                    )
+                )
                 return
 
             if text == "حذف زر":
                 admin_state[user_id] = {"action": "awaiting_remove"}
-                await safe_telegram_call(bot.send_message(
-                    chat_id=chat_id,
-                    text="أرسل الـ ID للزر الذي تريد حذفه",
-                    reply_markup=ReplyKeyboardRemove()
-                ))
+                await safe_telegram_call(
+                    bot.send_message(
+                        chat_id=chat_id,
+                        text="أرسل الـ ID للزر الذي تريد حذفه",
+                        reply_markup=ReplyKeyboardRemove()
+                    )
+                )
                 return
 
             if text == "عرض جميع الأزرار":
                 try:
                     rows = await db_fetchall("SELECT id, name, callback_data FROM buttons ORDER BY id")
                     text_msg = "\n".join(f"{r['id']}: {r['name']} ({r['callback_data']})" for r in rows)
-                    await safe_telegram_call(bot.send_message(
-                        chat_id=chat_id,
-                        text=text_msg or "لا توجد أزرار",
-                        reply_markup=ReplyKeyboardRemove()
-                    ))
+                    await safe_telegram_call(
+                        bot.send_message(
+                            chat_id=chat_id,
+                            text=text_msg or "لا توجد أزرار",
+                            reply_markup=ReplyKeyboardRemove()
+                        )
+                    )
                 except Exception as e:
                     logger.exception("Failed to list buttons: %s", e)
                 return
 
             if text == "رفع ملف لزر موجود":
                 admin_state[user_id] = {"action": "awaiting_upload_select"}
-                await safe_telegram_call(bot.send_message(
-                    chat_id=chat_id,
-                    text="أرسل ID الزر أو اسم الزر الذي تريد رفع ملفات له:",
-                    reply_markup=ReplyKeyboardRemove()
-                ))
+                await safe_telegram_call(
+                    bot.send_message(
+                        chat_id=chat_id,
+                        text="أرسل ID الزر أو اسم الزر الذي تريد رفع ملفات له:",
+                        reply_markup=ReplyKeyboardRemove()
+                    )
+                )
                 return
 
             if text == "حذف محتوى":
                 admin_state[user_id] = {"action": "awaiting_delete"}
-                await safe_telegram_call(bot.send_message(
-                    chat_id=chat_id,
-                    text="أرسل حذف المحتوى بالشكل: زر_ID|اسم_المحتوى   (مثال: 42|شرح_الفصل_الأول)",
-                    reply_markup=ReplyKeyboardRemove()
-                ))
+                await safe_telegram_call(
+                    bot.send_message(
+                        chat_id=chat_id,
+                        text="أرسل حذف المحتوى بالشكل: زر_ID|اسم_المحتوى   (مثال: 42|شرح_الفصل_الأول)",
+                        reply_markup=ReplyKeyboardRemove()
+                    )
+                )
                 return
     except Exception as e:
         logger.exception("Error in admin quick commands: %s", e)
@@ -356,31 +464,55 @@ if file_info and user_id in admin_state and admin_state[user_id].get("action") =
                     callback_data = f"btn_{int(time.time())}_{abs(hash(name))}"
                     await db_execute("INSERT INTO buttons (name, callback_data, parent_id) VALUES ($1,$2,$3)",
                                      name, callback_data, parent_id)
-                    await safe_telegram_call(bot.send_message(chat_id=chat_id, text=f"تم إضافة الزر '{name}'"))
+                    await safe_telegram_call(
+                        bot.send_message(
+                            chat_id=chat_id,
+                            text=f"تم إضافة الزر '{name}'"
+                        )
+                    )
                     admin_state.pop(user_id, None)
-                    await safe_telegram_call(bot.send_message(
-                        chat_id=chat_id,
-                        text="لوحة التحكم:",
-                        reply_markup=admin_panel_markup()
-                    ))
+                    await safe_telegram_call(
+                        bot.send_message(
+                            chat_id=chat_id,
+                            text="لوحة التحكم:",
+                            reply_markup=admin_panel_markup()
+                        )
+                    )
                 except Exception as e:
                     logger.exception("Failed to add button: %s", e)
-                    await safe_telegram_call(bot.send_message(chat_id=chat_id, text="خطأ في الإضافة"))
+                    await safe_telegram_call(
+                        bot.send_message(
+                            chat_id=chat_id,
+                            text="خطأ في الإضافة"
+                        )
+                    )
                 return
 
             if action == "awaiting_remove":
                 try:
                     bid = int(text.strip())
                     await db_execute("DELETE FROM buttons WHERE id = $1", bid)
-                    await safe_telegram_call(bot.send_message(chat_id=chat_id, text="تم الحذف"))
+                    await safe_telegram_call(
+                        bot.send_message(
+                            chat_id=chat_id,
+                            text="تم الحذف"
+                        )
+                    )
                     admin_state.pop(user_id, None)
-                    await safe_telegram_call(bot.send_message(
-                        chat_id=chat_id,
-                        text="لوحة التحكم:",
-                        reply_markup=admin_panel_markup()
-                    ))
+                    await safe_telegram_call(
+                        bot.send_message(
+                            chat_id=chat_id,
+                            text="لوحة التحكم:",
+                            reply_markup=admin_panel_markup()
+                        )
+                    )
                 except Exception:
-                    await safe_telegram_call(bot.send_message(chat_id=chat_id, text="خطأ في الحذف"))
+                    await safe_telegram_call(
+                        bot.send_message(
+                            chat_id=chat_id,
+                            text="خطأ في الحذف"
+                        )
+                    )
                 return
 
             if action == "awaiting_upload_select" and text:
@@ -389,14 +521,13 @@ if file_info and user_id in admin_state and admin_state[user_id].get("action") =
                     target_button = None
                     txt = text.strip()
 
-                    # try as integer id first
+                    # try parse as integer id
                     try:
                         bid = int(txt)
                         row = await db_fetchone("SELECT id, name FROM buttons WHERE id = $1", bid)
                         if row:
                             target_button = row["id"]
                     except Exception:
-                        # not an int or DB lookup failed for id; we'll try by name below
                         logger.debug("Input not an int or failed id lookup: %s", txt)
 
                     # if not found by id, try by exact name
@@ -423,10 +554,21 @@ if file_info and user_id in admin_state and admin_state[user_id].get("action") =
 
                     # success -> go to upload mode
                     admin_state[user_id] = {"action": "awaiting_upload", "target_button": target_button}
-                    await safe_telegram_call(bot.send_message(chat_id=chat_id, text=f"أرسل الملفات الآن. ستنضاف إلى الزر id={target_button}. أرسل 'انتهيت' عند الانتهاء.", reply_markup=admin_panel_markup()))
+                    await safe_telegram_call(
+                        bot.send_message(
+                            chat_id=chat_id,
+                            text=f"أرسل الملفات الآن. ستنضاف إلى الزر id={target_button}. أرسل 'انتهيت' عند الانتهاء.",
+                            reply_markup=admin_panel_markup()
+                        )
+                    )
                 except Exception as e:
                     logger.exception("Error selecting target button for upload: %s", e)
-                    await safe_telegram_call(bot.send_message(chat_id=chat_id, text="خطأ عند البحث عن الزر."))
+                    await safe_telegram_call(
+                        bot.send_message(
+                            chat_id=chat_id,
+                            text="خطأ عند البحث عن الزر."
+                        )
+                    )
                 return
 
             if action == "awaiting_delete" and text and "|" in text:
@@ -440,15 +582,36 @@ if file_info and user_id in admin_state and admin_state[user_id].get("action") =
                     # Confirm deletion
                     remaining = await db_fetchall("SELECT id FROM media_files WHERE button_id = $1 AND name = $2", bid, cname)
                     if remaining:
-                        await safe_telegram_call(bot.send_message(chat_id=chat_id, text="حدث خطأ — لم يتم حذف المحتوى بالكامل. تفقد القاعدة."))
+                        await safe_telegram_call(
+                            bot.send_message(
+                                chat_id=chat_id,
+                                text="حدث خطأ — لم يتم حذف المحتوى بالكامل. تفقد القاعدة."
+                            )
+                        )
                     else:
-                        await safe_telegram_call(bot.send_message(chat_id=chat_id, text=f"تم حذف المحتوى '{cname}' من الزر id={bid}.", reply_markup=admin_panel_markup()))
+                        await safe_telegram_call(
+                            bot.send_message(
+                                chat_id=chat_id,
+                                text=f"تم حذف المحتوى '{cname}' من الزر id={bid}.",
+                                reply_markup=admin_panel_markup()
+                            )
+                        )
                     admin_state.pop(user_id, None)
                 except ValueError:
-                    await safe_telegram_call(bot.send_message(chat_id=chat_id, text="معطل: أول جزء يجب أن يكون رقم الـ ID. مثال: 42|شرح_الفصل_الأول"))
+                    await safe_telegram_call(
+                        bot.send_message(
+                            chat_id=chat_id,
+                            text="معطل: أول جزء يجب أن يكون رقم الـ ID. مثال: 42|شرح_الفصل_الأول"
+                        )
+                    )
                 except Exception as e:
                     logger.exception("Failed to delete media by name: %s", e)
-                    await safe_telegram_call(bot.send_message(chat_id=chat_id, text="فشل حذف المحتوى. تأكد من أن الاسم مطابق تماماً."))
+                    await safe_telegram_call(
+                        bot.send_message(
+                            chat_id=chat_id,
+                            text="فشل حذف المحتوى. تأكد من أن الاسم مطابق تماماً."
+                        )
+                    )
                 return
 
     except Exception as e:
@@ -460,11 +623,13 @@ if file_info and user_id in admin_state and admin_state[user_id].get("action") =
             ok, missing, reasons = await check_user_membership(user_id)
             if not ok:
                 message = "✋ يلزم الانضمام إلى:\n" + "\n".join(f"- {c}" for c in missing) + "\n\nاضغط 'لقد انضممت — تحقق'"
-                await safe_telegram_call(bot.send_message(
-                    chat_id=chat_id,
-                    text=message,
-                    reply_markup=missing_chats_markup()
-                ))
+                await safe_telegram_call(
+                    bot.send_message(
+                        chat_id=chat_id,
+                        text=message,
+                        reply_markup=missing_chats_markup()
+                    )
+                )
                 return
 
             try:
@@ -476,11 +641,13 @@ if file_info and user_id in admin_state and admin_state[user_id].get("action") =
             user_current_menu[user_id] = 0
             markup = await build_main_menu()
             if markup:
-                await safe_telegram_call(bot.send_message(
-                    chat_id=chat_id,
-                    text="مرحباً! اختر القسم:",
-                    reply_markup=markup
-                ))
+                await safe_telegram_call(
+                    bot.send_message(
+                        chat_id=chat_id,
+                        text="مرحباً! اختر القسم:",
+                        reply_markup=markup
+                    )
+                )
             return
     except Exception as e:
         logger.exception("Error handling /start: %s", e)
@@ -489,11 +656,13 @@ if file_info and user_id in admin_state and admin_state[user_id].get("action") =
     try:
         if text == "الإدارة" and user_id in ADMIN_IDS:
             logger.debug("Admin panel requested by user_id=%s", user_id)
-            await safe_telegram_call(bot.send_message(
-                chat_id=chat_id,
-                text="لوحة التحكم:",
-                reply_markup=admin_panel_markup()
-            ))
+            await safe_telegram_call(
+                bot.send_message(
+                    chat_id=chat_id,
+                    text="لوحة التحكم:",
+                    reply_markup=admin_panel_markup()
+                )
+            )
             return
     except Exception as e:
         logger.exception("Error showing admin panel: %s", e)
@@ -527,40 +696,47 @@ if file_info and user_id in admin_state and admin_state[user_id].get("action") =
                 if button.get("parent_id") == 0:
                     markup = await build_main_menu()
                     if markup:
-                        await safe_telegram_call(bot.send_message(
-                            chat_id=chat_id,
-                            text="اختر القسم التالي:",
-                            reply_markup=markup
-                        ))
+                        await safe_telegram_call(
+                            bot.send_message(
+                                chat_id=chat_id,
+                                text="اختر القسم التالي:",
+                                reply_markup=markup
+                            )
+                        )
                 else:
                     markup = await build_compact_submenu(button["parent_id"])
                     if markup:
                         parent_button = await db_fetchone("SELECT name FROM buttons WHERE id = $1", button["parent_id"])
                         parent_name = parent_button["name"] if parent_button else "القسم"
-                        await safe_telegram_call(bot.send_message(
-                            chat_id=chat_id,
-                            text=f"اختر من {parent_name}:",
-                            reply_markup=markup
-                        ))
+                        await safe_telegram_call(
+                            bot.send_message(
+                                chat_id=chat_id,
+                                text=f"اختر من {parent_name}:",
+                                reply_markup=markup
+                            )
+                        )
                 return
 
             # No media files: treat as menu button (show submenu)
             user_current_menu[user_id] = button["id"]
             markup = await build_compact_submenu(button["id"])
             if markup:
-                # original button text is in `text` variable
-                await safe_telegram_call(bot.send_message(
-                    chat_id=chat_id,
-                    text=f"اختر من {text}:",
-                    reply_markup=markup
-                ))
+                await safe_telegram_call(
+                    bot.send_message(
+                        chat_id=chat_id,
+                        text=f"اختر من {text}:",
+                        reply_markup=markup
+                    )
+                )
                 return
             else:
-                await safe_telegram_call(bot.send_message(
-                    chat_id=chat_id,
-                    text="لا محتوى متاح حالياً",
-                    reply_markup=await build_main_menu()
-                ))
+                await safe_telegram_call(
+                    bot.send_message(
+                        chat_id=chat_id,
+                        text="لا محتوى متاح حالياً",
+                        reply_markup=await build_main_menu()
+                    )
+                )
                 return
     except Exception as e:
         logger.exception("Error handling DB-driven button: %s", e)
@@ -570,16 +746,20 @@ if file_info and user_id in admin_state and admin_state[user_id].get("action") =
         logger.debug("Unrecognized text; sending main menu if available")
         main_markup = await build_main_menu()
         if main_markup:
-            await safe_telegram_call(bot.send_message(
-                chat_id=chat_id,
-                text="اختر القسم:",
-                reply_markup=main_markup
-            ))
+            await safe_telegram_call(
+                bot.send_message(
+                    chat_id=chat_id,
+                    text="اختر القسم:",
+                    reply_markup=main_markup
+                )
+            )
         else:
-            await safe_telegram_call(bot.send_message(
-                chat_id=chat_id,
-                text="عذراً، لم أفهم الرسالة."
-            ))
+            await safe_telegram_call(
+                bot.send_message(
+                    chat_id=chat_id,
+                    text="عذراً، لم أفهم الرسالة."
+                )
+            )
     except Exception as e:
         logger.exception("Error sending fallback/main menu: %s", e)
 
