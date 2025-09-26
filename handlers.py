@@ -175,33 +175,51 @@ async def process_update(msg: dict):
         logger.debug("Ignoring message from a bot or from the bot itself")
         return
 
-    # -------- Admin: handle file upload -> then ask for name --------
-    file_info = extract_file_from_message(msg)
-    if file_info and user_id in admin_state and admin_state[user_id].get("action") == "awaiting_upload":
-        state = admin_state[user_id]
-        target_button = state.get("target_button")
-        if not target_button:
-            await safe_telegram_call(bot.send_message(chat_id=chat_id, text="لم يتم تحديد زر الهدف. أرسل ID الزر أولاً."))
-            return
+ # -------- Admin: handle file upload -> caption used as name if present --------
+file_info = extract_file_from_message(msg)
+if file_info and user_id in admin_state and admin_state[user_id].get("action") == "awaiting_upload":
+    state = admin_state[user_id]
+    target_button = state.get("target_button")
+    if not target_button:
+        await safe_telegram_call(bot.send_message(chat_id=chat_id, text="لم يتم تحديد زر الهدف. أرسل ID الزر أولاً."))
+        return
 
-        try:
-            # Insert and return id so we can ask name
-            row = await db_fetchone(
-                "INSERT INTO media_files (button_id, file_id, content_type, caption, sort_order, name) VALUES ($1,$2,$3,$4,$5,$6) RETURNING id",
-                target_button, file_info["file_id"], file_info["content_type"], file_info.get("caption"), 0, None
-            )
-            new_id = row["id"] if row else None
-            # move to naming step for this uploaded file
+    # Use caption as name if provided and non-empty
+    caption = (file_info.get("caption") or "").strip()
+    provided_name = caption if caption else None
+
+    try:
+        # Insert row; if provided_name is set, store it directly in name column
+        row = await db_fetchone(
+            "INSERT INTO media_files (button_id, file_id, content_type, caption, sort_order, name) "
+            "VALUES ($1,$2,$3,$4,$5,$6) RETURNING id",
+            target_button,
+            file_info["file_id"],
+            file_info["content_type"],
+            file_info.get("caption"),
+            0,
+            provided_name
+        )
+        new_id = row["id"] if row else None
+
+        if provided_name:
+            # Caption used as name — go back to upload mode (no naming step)
+            admin_state[user_id] = {"action": "awaiting_upload", "target_button": target_button}
+            # truncate shown name for safety in message (200 chars)
+            shown = provided_name[:200]
+            await safe_telegram_call(bot.send_message(chat_id=chat_id, text=f"تم رفع الملف وحفظ الاسم من الـ caption: {shown}\nأرسل ملف آخر أو اكتب 'انتهيت' لإنهاء.", reply_markup=admin_panel_markup()))
+        else:
+            # No caption -> ask admin for name (existing flow)
             admin_state[user_id] = {
                 "action": "awaiting_name",
                 "target_button": target_button,
                 "last_media_id": new_id
             }
             await safe_telegram_call(bot.send_message(chat_id=chat_id, text="تم رفع الملف. أرسل اسم المحتوى لهذا الملف الآن (أو اكتب 'تخطى' لترك الاسم فارغاً).", reply_markup=admin_panel_markup()))
-        except Exception as e:
-            logger.exception("Failed to insert media file: %s", e)
-            await safe_telegram_call(bot.send_message(chat_id=chat_id, text="فشل رفع الملف."))
-        return
+    except Exception as e:
+        logger.exception("Failed to insert media file: %s", e)
+        await safe_telegram_call(bot.send_message(chat_id=chat_id, text="فشل رفع الملف."))
+    return
 
     # -------- Admin: handle naming the last uploaded file --------
     if user_id in admin_state and admin_state[user_id].get("action") == "awaiting_name":
