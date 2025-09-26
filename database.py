@@ -75,18 +75,18 @@ async def check_db_health():
 
 async def init_db_schema_and_defaults():
     try:
+        # Buttons table (menu items)
         await db_execute("""
             CREATE TABLE IF NOT EXISTS buttons (
                 id SERIAL PRIMARY KEY,
                 name TEXT NOT NULL,
                 callback_data TEXT UNIQUE NOT NULL,
                 parent_id INTEGER DEFAULT 0,
-                content_type TEXT,
-                file_id TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
-        
+
+        # Users table
         await db_execute("""
             CREATE TABLE IF NOT EXISTS users (
                 user_id BIGINT PRIMARY KEY,
@@ -96,14 +96,33 @@ async def init_db_schema_and_defaults():
                 registered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
-        
-        defaults = [("العلمي", "science", 0), ("الأدبي", "literary", 0), ("الإدارة", "admin_panel", 0)]
+
+        # Media files table (many files per button)
+        await db_execute("""
+            CREATE TABLE IF NOT EXISTS media_files (
+                id SERIAL PRIMARY KEY,
+                button_id INTEGER NOT NULL REFERENCES buttons(id) ON DELETE CASCADE,
+                file_id TEXT NOT NULL,
+                content_type TEXT NOT NULL,
+                caption TEXT,
+                sort_order INTEGER DEFAULT 0,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        # Insert defaults if not exist
+        defaults = [
+            ("العلمي", "science", 0),
+            ("الأدبي", "literary", 0),
+            ("الإدارة", "admin_panel", 0)
+        ]
         for name, cb, parent in defaults:
             await db_execute(
                 "INSERT INTO buttons (name, callback_data, parent_id) VALUES ($1,$2,$3) ON CONFLICT (callback_data) DO NOTHING",
                 name, cb, parent
             )
-        logger.info("DB schema initialized")
+
+        logger.info("DB schema initialized with media_files support")
     except Exception as e:
         logger.error("Failed to init DB schema: %s", e)
         raise
