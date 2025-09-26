@@ -105,7 +105,6 @@ async def send_files_for_button(bot, chat_id: int, files: Sequence[dict]):
 
 
 # ---------------- Media extraction helper ----------------
-
 def extract_file_from_message(msg: dict) -> Optional[dict]:
     """Return dict with keys (file_id, content_type, caption) or None if no file.
     Handles: document, photo, video, audio, animation, voice.
@@ -114,7 +113,7 @@ def extract_file_from_message(msg: dict) -> Optional[dict]:
     if not msg:
         return None
 
-    caption = msg.get("caption") or msg.get("text") if isinstance(msg.get("text"), str) else None
+    caption = msg.get("caption") or None
 
     if "document" in msg:
         d = msg["document"]
@@ -139,13 +138,15 @@ def extract_file_from_message(msg: dict) -> Optional[dict]:
     return None
 
 
-# ---------------- Main handler (replaces previous process_text_message) ----------------
+# ---------------- Main handler ----------------
 
 async def process_update(msg: dict):
-    """Handle incoming Telegram message update. Accepts both text and media.
+    """
+    Handle incoming Telegram message update. Accepts both text and media.
 
-    This function keeps the same behaviour as your previous text handler and
-    adds admin upload flow for attaching multiple files to a button.
+    New features:
+      - Admins can upload a file and then give it a name (title).
+      - Admins can delete a content item by sending: زر_ID|اسم_المحتوى after choosing 'حذف محتوى'.
     """
     bot = get_bot()
     BOT_ID = get_bot_id()
@@ -174,7 +175,7 @@ async def process_update(msg: dict):
         logger.debug("Ignoring message from a bot or from the bot itself")
         return
 
-    # First: handle media uploads from admins when in upload state
+    # -------- Admin: handle file upload -> then ask for name --------
     file_info = extract_file_from_message(msg)
     if file_info and user_id in admin_state and admin_state[user_id].get("action") == "awaiting_upload":
         state = admin_state[user_id]
@@ -184,18 +185,53 @@ async def process_update(msg: dict):
             return
 
         try:
-            await db_execute(
-                "INSERT INTO media_files (button_id, file_id, content_type, caption, sort_order) VALUES ($1,$2,$3,$4,$5)",
-                target_button, file_info["file_id"], file_info["content_type"], file_info.get("caption"), 0
+            # Insert and return id so we can ask name
+            row = await db_fetchone(
+                "INSERT INTO media_files (button_id, file_id, content_type, caption, sort_order, name) VALUES ($1,$2,$3,$4,$5,$6) RETURNING id",
+                target_button, file_info["file_id"], file_info["content_type"], file_info.get("caption"), 0, None
             )
-            await safe_telegram_call(bot.send_message(chat_id=chat_id, text="تم إضافة الملف. أرسل ملفات إضافية أو اكتب 'انتهيت' لإنهاء.", reply_markup=admin_panel_markup()))
+            new_id = row["id"] if row else None
+            # move to naming step for this uploaded file
+            admin_state[user_id] = {
+                "action": "awaiting_name",
+                "target_button": target_button,
+                "last_media_id": new_id
+            }
+            await safe_telegram_call(bot.send_message(chat_id=chat_id, text="تم رفع الملف. أرسل اسم المحتوى لهذا الملف الآن (أو اكتب 'تخطى' لترك الاسم فارغاً).", reply_markup=admin_panel_markup()))
         except Exception as e:
             logger.exception("Failed to insert media file: %s", e)
             await safe_telegram_call(bot.send_message(chat_id=chat_id, text="فشل رفع الملف."))
         return
 
+    # -------- Admin: handle naming the last uploaded file --------
+    if user_id in admin_state and admin_state[user_id].get("action") == "awaiting_name":
+        # Expecting a text name for the last uploaded media
+        if text:
+            st = admin_state[user_id]
+            last_media_id = st.get("last_media_id")
+            if text.strip().lower() == "تخطى":
+                # leave name null/empty and return to upload mode
+                await db_execute("UPDATE media_files SET name = NULL WHERE id = $1", last_media_id)
+                admin_state[user_id] = {"action": "awaiting_upload", "target_button": st.get("target_button")}
+                await safe_telegram_call(bot.send_message(chat_id=chat_id, text="تم حفظ الملف بدون اسم. أرسل ملف آخر أو اكتب 'انتهيت' لإنهاء.", reply_markup=admin_panel_markup()))
+                return
+
+            try:
+                # Save the provided name
+                await db_execute("UPDATE media_files SET name = $1 WHERE id = $2", text.strip(), last_media_id)
+                # go back to upload mode so admin can add more files
+                admin_state[user_id] = {"action": "awaiting_upload", "target_button": st.get("target_button")}
+                await safe_telegram_call(bot.send_message(chat_id=chat_id, text=f\"تم حفظ الاسم: {text.strip()}. أرسل ملف آخر أو اكتب 'انتهيت' لإنهاء.\", reply_markup=admin_panel_markup()))
+            except Exception as e:
+                logger.exception(\"Failed to update media_files.name: %s\", e)
+                await safe_telegram_call(bot.send_message(chat_id=chat_id, text=\"فشل حفظ الاسم.\"))
+
+        else:
+            await safe_telegram_call(bot.send_message(chat_id=chat_id, text=\"أرسل اسم المحتوى كنص أو اكتب 'تخطى' لتركه فارغاً.\"))
+        return
+
     # If admin typed 'انتهيت' while in upload mode -> finish
-    if text == "انتهيت" and user_id in admin_state and admin_state[user_id].get("action") == "awaiting_upload":
+    if text == "انتهيت" and user_id in admin_state and admin_state[user_id].get("action") in ("awaiting_upload", "awaiting_name"):
         admin_state.pop(user_id, None)
         await safe_telegram_call(bot.send_message(chat_id=chat_id, text="انتهى الرفع.", reply_markup=admin_panel_markup()))
         return
@@ -276,6 +312,15 @@ async def process_update(msg: dict):
                     reply_markup=ReplyKeyboardRemove()
                 ))
                 return
+
+            if text == "حذف محتوى":
+                admin_state[user_id] = {"action": "awaiting_delete"}
+                await safe_telegram_call(bot.send_message(
+                    chat_id=chat_id,
+                    text="أرسل حذف المحتوى بالشكل: زر_ID|اسم_المحتوى   (مثال: 42|شرح_الفصل_الأول)",
+                    reply_markup=ReplyKeyboardRemove()
+                ))
+                return
     except Exception as e:
         logger.exception("Error in admin quick commands: %s", e)
 
@@ -344,6 +389,30 @@ async def process_update(msg: dict):
                 except Exception as e:
                     logger.exception("Error selecting target button for upload: %s", e)
                     await safe_telegram_call(bot.send_message(chat_id=chat_id, text="خطأ عند البحث عن الزر."))
+                return
+
+            if action == "awaiting_delete" and text and "|" in text:
+                # Expecting "button_id|content_name"
+                try:
+                    bid_str, content_name = text.split("|", 1)
+                    bid = int(bid_str.strip())
+                    cname = content_name.strip()
+                    # Delete the specified named content for the given button
+                    res = await db_execute("DELETE FROM media_files WHERE button_id = $1 AND name = $2", bid, cname)
+                    # db_execute returns status like 'DELETE 1' or similar; we can confirm existence by checking rows.
+                    # To be explicit, try to fetch after delete to verify 0 rows left with that name:
+                    remaining = await db_fetchall("SELECT id FROM media_files WHERE button_id = $1 AND name = $2", bid, cname)
+                    if remaining:
+                        # something unusual: still present
+                        await safe_telegram_call(bot.send_message(chat_id=chat_id, text="حدث خطأ — لم يتم حذف المحتوى بالكامل. تفقد القاعدة."))
+                    else:
+                        await safe_telegram_call(bot.send_message(chat_id=chat_id, text=f"تم حذف المحتوى '{cname}' من الزر id={bid}.", reply_markup=admin_panel_markup()))
+                    admin_state.pop(user_id, None)
+                except ValueError:
+                    await safe_telegram_call(bot.send_message(chat_id=chat_id, text="معطل: أول جزء يجب أن يكون رقم الـ ID. مثال: 42|شرح_الفصل_الأول"))
+                except Exception as e:
+                    logger.exception("Failed to delete media by name: %s", e)
+                    await safe_telegram_call(bot.send_message(chat_id=chat_id, text="فشل حذف المحتوى. تأكد من أن الاسم مطابق تماماً."))
                 return
 
     except Exception as e:
