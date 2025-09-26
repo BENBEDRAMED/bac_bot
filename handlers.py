@@ -369,21 +369,41 @@ async def process_update(msg: dict):
                 # admin provided an ID or name for the target button
                 try:
                     target_button = None
+                    txt = text.strip()
+
+                    # try as integer id first
                     try:
-                        bid = int(text.strip())
+                        bid = int(txt)
                         row = await db_fetchone("SELECT id, name FROM buttons WHERE id = $1", bid)
                         if row:
-                            target_button = row['id']
+                            target_button = row["id"]
                     except Exception:
-                        # not an int; try name
-                        row = await db_fetchone("SELECT id, name FROM buttons WHERE name = $1", text.strip())
-                        if row:
-                            target_button = row['id']
+                        # not an int or DB lookup failed for id; we'll try by name below
+                        logger.debug("Input not an int or failed id lookup: %s", txt)
 
+                    # if not found by id, try by exact name
+                    if target_button is None:
+                        row = await db_fetchone("SELECT id, name FROM buttons WHERE name = $1", txt)
+                        if row:
+                            target_button = row["id"]
+
+                    # if still not found, show helpful list of available buttons
                     if not target_button:
-                        await safe_telegram_call(bot.send_message(chat_id=chat_id, text="لم أجد زر مطابق. أعد المحاولة أو أرسل 'الغاء'"))
+                        rows = await db_fetchall("SELECT id, name FROM buttons ORDER BY id")
+                        if rows:
+                            sample = "\n".join(f"{r['id']}: {r['name']}" for r in rows)
+                        else:
+                            sample = "لا توجد أزرار حالياً"
+
+                        await safe_telegram_call(
+                            bot.send_message(
+                                chat_id=chat_id,
+                                text=f"لم أجد زر مطابق لـ '{txt}'. الأزرار المتاحة الآن:\n{sample}\nأعد المحاولة أو أرسل 'الغاء' لتلغي العملية."
+                            )
+                        )
                         return
 
+                    # success -> go to upload mode
                     admin_state[user_id] = {"action": "awaiting_upload", "target_button": target_button}
                     await safe_telegram_call(bot.send_message(chat_id=chat_id, text=f"أرسل الملفات الآن. ستنضاف إلى الزر id={target_button}. أرسل 'انتهيت' عند الانتهاء.", reply_markup=admin_panel_markup()))
                 except Exception as e:
