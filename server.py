@@ -3,6 +3,7 @@ import time
 import asyncio
 import threading
 import sys
+import requests  # <-- ADD THIS IMPORT
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, HTMLResponse
 from contextlib import asynccontextmanager
@@ -10,7 +11,7 @@ from contextlib import asynccontextmanager
 from database import init_pg_pool, init_db_schema_and_defaults, check_db_health, pg_pool
 from telegram_client import init_bot, get_bot
 from settings import BOT_TOKEN, DATABASE_URL, WEBHOOK_URL, WEBHOOK_SECRET_TOKEN, MAX_CONCURRENT
-from handlers import process_text_message  # Remove handle_callback_query import
+from handlers import process_text_message
 import logging
 
 logger = logging.getLogger(__name__)
@@ -22,6 +23,29 @@ REQUEST_HISTORY = []
 ACTIVE_REQUESTS = 0
 PROCESSING_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT)
 
+# Add your Render app URL (replace with your actual URL)
+RENDER_APP_URL = "https://your-app-name.onrender.com"  # <-- ADD THIS
+
+# ---- Wakeup route ----
+@app.get("/wakeup")  # <-- ADD THIS ROUTE
+async def wakeup():
+    return {"status": "awake", "timestamp": time.time()}
+
+def keep_alive():  # <-- ADD THIS FUNCTION
+    """Keep the app awake by pinging itself periodically"""
+    def run_ping():
+        while True:
+            try:
+                logger.info("Pinging to keep awake...")
+                response = requests.get(f"{RENDER_APP_URL.rstrip('/')}/wakeup", timeout=10)
+                logger.info(f"Wakeup ping successful: {response.status_code}")
+            except Exception as e:
+                logger.error(f"Wakeup ping failed: {e}")
+            time.sleep(300)  # Ping every 5 minutes
+    
+    thread = threading.Thread(target=run_ping, daemon=True)
+    thread.start()
+    logger.info("Keep-alive thread started!")
 
 # ---- Webhook route ----
 @app.post("/webhook")
@@ -54,7 +78,6 @@ async def webhook(request: Request):
 
     except Exception as e:
         logger.error(f"Webhook handler error: {e}")
-        # Always return 200 so Telegram doesn't retry with flood
         return {"ok": True}
 
     finally:
@@ -78,6 +101,10 @@ async def lifespan(app: FastAPI):
             else:
                 await bot_instance.set_webhook(webhook_url)
             logger.info(f"Webhook set: {webhook_url}")
+        
+        # Start keep-alive thread  # <-- ADD THIS
+        keep_alive()
+        
     except Exception as e:
         logger.error(f"Startup failed: {e}")
 
@@ -97,7 +124,7 @@ app.router.lifespan_context = lifespan
 # ---- Health and test routes ----
 @app.get("/")
 async def root():
-    return HTMLResponse("<h1>🤖 Bot is Running</h1><p><a href='/health'>Check Health</a></p>")
+    return HTMLResponse("<h1>🤖 Bot is Running</h1><p><a href='/health'>Check Health</a></p><p><a href='/wakeup'>Wakeup Check</a></p>")  # <-- Updated
 
 @app.get("/health")
 async def health_check():
@@ -112,5 +139,6 @@ async def health_check():
         "max_concurrent": MAX_CONCURRENT,
         "semaphore_value": PROCESSING_SEMAPHORE._value,
         "processed_updates": len(PROCESSED_UPDATES),
-        "request_history": list(REQUEST_HISTORY)
+        "request_history": list(REQUEST_HISTORY),
+        "wakeup_endpoint": f"{RENDER_APP_URL}/wakeup"  # <-- Added wakeup info
     }, status_code=status_code)
